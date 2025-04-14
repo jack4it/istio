@@ -323,11 +323,20 @@ spec:
         {{- end }}
       {{- end }}
 ---
+{{ $serviceAnnotations := strdict }} # We need to tell the Azure LB to use the kube-proxy health check port
+{{- if eq (index .Annotations "networking.istio.io/service-type" | default "LoadBalancer") "LoadBalancer" }}
+  {{- range $key, $val := .Ports }}
+    {{- if has (lower $val.AppProtocol) (list "http" "http2" "https") }}
+      {{ $port := $val.Port }}
+      {{- $serviceAnnotations = mergeMaps $serviceAnnotations (strdict (printf "service.beta.kubernetes.io/port_%d_health-probe_protocol" $port) "http" (printf "service.beta.kubernetes.io/port_%d_health-probe_port" $port) "10256" (printf "service.beta.kubernetes.io/port_%d_health-probe_request-path" $port) "/healthz") }}
+    {{- end }}
+  {{- end }}
+{{- end }}
 apiVersion: v1
 kind: Service
 metadata:
   annotations:
-    {{ toJsonMap (omit .InfrastructureAnnotations "kubectl.kubernetes.io/last-applied-configuration" "gateway.istio.io/name-override" "gateway.istio.io/service-account" "gateway.istio.io/controller-version") | nindent 4 }}
+    {{ toJsonMap (omit .InfrastructureAnnotations "kubectl.kubernetes.io/last-applied-configuration" "gateway.istio.io/name-override" "gateway.istio.io/service-account" "gateway.istio.io/controller-version") $serviceAnnotations | nindent 4 }}
   labels:
     {{- toJsonMap
       .InfrastructureLabels
