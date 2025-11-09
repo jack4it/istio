@@ -291,11 +291,10 @@ func (n *kubeNamespace) IsInjected() bool {
 	// TODO cache labels and invalidate on SetLabel to avoid a ton of kube calls
 	labels, err := n.Labels()
 	if err != nil {
-		scopes.Framework.Warnf("failed getting labels for namespace %s, assuming injection is on", n.name)
-		return true
+		scopes.Framework.Warnf("failed getting labels for namespace %s, assuming injection is off", n.name)
+		return false
 	}
-	_, hasRevision := labels[label.IoIstioRev.Name]
-	return hasRevision || labels["istio-injection"] == "enabled"
+	return labels["istio-injection"] == "enabled"
 }
 
 // createNamespaceLabels will take a namespace config and generate the proper k8s labels
