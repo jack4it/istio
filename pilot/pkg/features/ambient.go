@@ -76,6 +76,22 @@ var (
 		"ENABLE_LAYERED_WAYPOINT_AUTHORIZATION_POLICIES",
 		false,
 		"If enabled, selector based authorization policies will be enforced as L4 policies in front of the waypoint.").Get()
+
+	EnableGossipFederation = registerAmbient("PILOT_ENABLE_GOSSIP_FEDERATION", false, false,
+		"If enabled, istiod will use gossip-based federation to synchronize ambient global services with peer istiod instances.")
+
+	GossipPeers = env.Register("PILOT_GOSSIP_PEERS", "",
+		"Comma-separated list of peer istiod addresses (host:port) for cross-cluster gossip federation. "+
+			"If empty, peers are discovered via istiod Service endpoints.").Get()
+
+	GossipBindPort = env.Register("PILOT_GOSSIP_BIND_PORT", 7946,
+		"The port to bind for gossip protocol communication between istiod peers.").Get()
+
+	GossipAdvertiseAddr = env.Register("PILOT_GOSSIP_ADVERTISE_ADDR", "",
+		"The address to advertise to other istiod peers for gossip. If empty, the bind address is used.").Get()
+
+	GossipLocalNetwork = env.Register("PILOT_GOSSIP_LOCAL_NETWORK", "",
+		"The network ID of the local cluster for gossip federation. Used to identify which network gateway to sync.").Get()
 )
 
 // registerAmbient registers a variable that is allowed only if EnableAmbient is set

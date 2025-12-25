@@ -187,6 +187,32 @@ func (c *Controller) ServiceInfo(key string) *model.ServiceInfo {
 	return nil
 }
 
+// AmbientIndexGetter is an optional interface that registries can implement to expose their ambient index.
+type AmbientIndexGetter interface {
+	// AmbientIndex returns the ambient index for this registry, or nil if ambient is not enabled.
+	AmbientIndex() model.GossipAmbientIndex
+}
+
+// GetAmbientIndex returns the ambient index from the config cluster's registry, if available.
+// This provides direct access to the ambient index for gossip integration.
+func (c *Controller) GetAmbientIndex() model.GossipAmbientIndex {
+	if !features.EnableAmbient {
+		return nil
+	}
+	c.storeLock.RLock()
+	defer c.storeLock.RUnlock()
+	for _, entry := range c.registries {
+		// Only get from the local config cluster.
+		if entry.Cluster() == c.configClusterID && entry.Provider() == provider.Kubernetes {
+			// Access the embedded Instance field directly to get the concrete type
+			if getter, ok := entry.Instance.(AmbientIndexGetter); ok {
+				return getter.AmbientIndex()
+			}
+		}
+	}
+	return nil
+}
+
 type registryEntry struct {
 	serviceregistry.Instance
 	// stop if not nil is the per-registry stop chan. If null, the server stop chan should be used to Run the registry.

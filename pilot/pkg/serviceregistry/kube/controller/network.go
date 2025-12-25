@@ -348,7 +348,25 @@ func (n *networkManager) getGatewayDetails(svc *model.Service) []model.NetworkGa
 		if !acceptHBONE {
 			hbonePort = 0
 		}
-		return []model.NetworkGateway{{Port: uint32(gwPort), HBONEPort: uint32(hbonePort), Network: network.ID(nw)}}
+
+		// Determine the service account for the gateway. If the service is managed by a Gateway
+		// resource, use the gateway name as the service account (Istio gateway controller creates
+		// pods with service account matching the gateway name).
+		saName := svc.Attributes.Name
+		if gwName := svc.Attributes.Labels["gateway.networking.k8s.io/gateway-name"]; gwName != "" {
+			saName = gwName
+		}
+
+		return []model.NetworkGateway{{
+			Port:      uint32(gwPort),
+			HBONEPort: uint32(hbonePort),
+			Network:   network.ID(nw),
+			Cluster:   n.clusterID,
+			ServiceAccount: types.NamespacedName{
+				Namespace: svc.Attributes.Namespace,
+				Name:      saName,
+			},
+		}}
 	}
 
 	// meshNetworks registryServiceName+fromRegistry

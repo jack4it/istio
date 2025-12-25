@@ -17,11 +17,15 @@ package bootstrap
 import (
 	"fmt"
 
+	"istio.io/istio/pilot/pkg/features"
+	"istio.io/istio/pilot/pkg/model"
 	"istio.io/istio/pilot/pkg/serviceregistry/aggregate"
+	"istio.io/istio/pilot/pkg/serviceregistry/gossip"
 	kubecontroller "istio.io/istio/pilot/pkg/serviceregistry/kube/controller"
 	"istio.io/istio/pilot/pkg/serviceregistry/provider"
 	"istio.io/istio/pilot/pkg/serviceregistry/serviceentry"
 	"istio.io/istio/pkg/log"
+	"istio.io/istio/pkg/network"
 	"istio.io/istio/pkg/util/sets"
 )
 
@@ -59,6 +63,14 @@ func (s *Server) initServiceControllers(args *PilotArgs) error {
 		}
 	}
 
+	// Initialize gossip federation if enabled.
+	// Must be done before serviceControllers.Run so the sync protocol gets started.
+	if features.EnableGossipFederation {
+		if err := s.initGossipSync(args, serviceControllers); err != nil {
+			return err
+		}
+	}
+
 	// Defer running of the service controllers.
 	s.addStartFunc("service controllers", func(stop <-chan struct{}) error {
 		go serviceControllers.Run(stop)
@@ -91,4 +103,61 @@ func (s *Server) initKubeRegistry(args *PilotArgs) (err error) {
 		s.multiclusterController)
 
 	return err
+}
+
+// initGossipSync initializes gossip-based federation.
+// This enables peer-to-peer synchronization of ambient global services between istiod instances.
+func (s *Server) initGossipSync(args *PilotArgs, serviceControllers *aggregate.Controller) error {
+	log.Info("Initializing gossip federation")
+
+	stopCh := make(chan struct{})
+
+	// Get local network from feature flag
+	localNetwork := network.ID(features.GossipLocalNetwork)
+
+	// Create sync protocol - gossip data flows directly to ambient index via KRT collections
+	// We pass a getter for the ambient index because it may not be available until the
+	// k8s registry is fully initialized (which happens asynchronously via multicluster).
+	syncProtocol, err := gossip.NewSyncProtocol(gossip.SyncProtocolConfig{
+		LocalClusterID: s.clusterID,
+		AmbientIndexGetter: func() model.GossipAmbientIndex {
+			return serviceControllers.GetAmbientIndex()
+		},
+		LocalNetworkGatewayGetter: func() *model.NetworkGateway {
+			if s.environment.NetworkManager != nil && localNetwork != "" {
+				gateways := s.environment.NetworkManager.GatewaysForNetwork(localNetwork)
+				if len(gateways) > 0 {
+					return &gateways[0]
+				}
+			}
+			return nil
+		},
+		TrustDomainGetter: func() string {
+			return s.environment.Mesh().GetTrustDomain()
+		},
+		XDSUpdater:    s.XDSServer,
+		NodeName:      gossip.NodeName(s.clusterID),
+		BindAddr:      "0.0.0.0",
+		BindPort:      features.GossipBindPort,
+		AdvertiseAddr: features.GossipAdvertiseAddr,
+		StopCh:        stopCh,
+	})
+	if err != nil {
+		return fmt.Errorf("failed to create sync protocol: %w", err)
+	}
+
+	// Start the sync protocol
+	s.addStartFunc("gossip registry", func(stop <-chan struct{}) error {
+		go func() {
+			<-stop
+			close(stopCh)
+			if err := syncProtocol.Stop(); err != nil {
+				log.Warnf("Error stopping sync protocol: %v", err)
+			}
+		}()
+		return syncProtocol.Start()
+	})
+
+	log.Info("Gossip federation initialized")
+	return nil
 }

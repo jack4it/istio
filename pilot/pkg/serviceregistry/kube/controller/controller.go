@@ -715,6 +715,16 @@ func (c *Controller) Stop() {
 	}
 }
 
+// AmbientIndex returns the ambient index for this controller.
+// Returns nil if ambient is not enabled.
+// This satisfies aggregate.AmbientIndexGetter interface.
+func (c *Controller) AmbientIndex() model.GossipAmbientIndex {
+	if c.ambientIndex == nil {
+		return nil
+	}
+	return c.ambientIndex
+}
+
 // Services implements a service catalog operation
 func (c *Controller) Services() []*model.Service {
 	c.RLock()
