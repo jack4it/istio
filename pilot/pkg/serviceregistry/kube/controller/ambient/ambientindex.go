@@ -50,8 +50,6 @@ import (
 	"istio.io/istio/pkg/network"
 	"istio.io/istio/pkg/ptr"
 	"istio.io/istio/pkg/slices"
-	"istio.io/istio/pkg/spiffe"
-	"istio.io/istio/pkg/util/protomarshal"
 	"istio.io/istio/pkg/util/sets"
 	"istio.io/istio/pkg/workloadapi"
 )
@@ -139,11 +137,9 @@ type index struct {
 	remoteClientConfigOverrides []func(*rest.Config)
 	builder                     Builder
 
-	// gossipServices and gossipWorkloads hold gossip-federated external services/workloads.
-	// These are populated by the gossip registry when enabled.
-	gossipServices   krt.StaticCollection[model.ServiceInfo]
-	gossipWorkloads  krt.StaticCollection[model.WorkloadInfo]
-	gossipRegistered bool
+	// gossip holds gossip-federated external services/workloads state.
+	// Populated by the gossip registry when enabled.
+	gossip gossipIndex
 }
 
 type FeatureFlags struct {
@@ -630,10 +626,8 @@ func (a *index) Lookup(key string) []model.AddressInfo {
 	}
 
 	// 1b. Workload UID (gossip workloads)
-	if a.gossipRegistered {
-		if w := a.gossipWorkloads.GetKey(key); w != nil {
-			return []model.AddressInfo{w.AsAddress}
-		}
+	if w := a.lookupGossipWorkloadByKey(key); w != nil {
+		return []model.AddressInfo{w.AsAddress}
 	}
 
 	// 2. Workload by IP
@@ -669,39 +663,6 @@ func (a *index) Lookup(key string) []model.AddressInfo {
 	return nil
 }
 
-// lookupGossip checks gossip collections for services and workloads.
-func (a *index) lookupGossip(key string) []model.AddressInfo {
-	if !a.gossipRegistered {
-		return nil
-	}
-
-	// Try service lookup by key (namespace/hostname)
-	if svc := a.gossipServices.GetKey(key); svc != nil {
-		res := []model.AddressInfo{svc.AsAddress}
-		// Also get workloads for this service
-		res = append(res, a.lookupGossipWorkloadsForService(svc.ResourceName())...)
-		return res
-	}
-
-	return nil
-}
-
-// lookupGossipWorkloadsForService returns gossip workloads that serve the given service.
-func (a *index) lookupGossipWorkloadsForService(serviceKey string) []model.AddressInfo {
-	if !a.gossipRegistered {
-		return nil
-	}
-
-	var res []model.AddressInfo
-	for _, w := range a.gossipWorkloads.List() {
-		// Check if this workload serves the requested service
-		if _, ok := w.Workload.Services[serviceKey]; ok {
-			res = append(res, w.AsAddress)
-		}
-	}
-	return res
-}
-
 func (a *index) lookupService(key string) *model.ServiceInfo {
 	// 1. namespace/hostname format (local services)
 	s := a.services.GetKey(key)
@@ -720,19 +681,12 @@ func (a *index) lookupService(key string) *model.ServiceInfo {
 	}
 
 	// 3. Check gossip services if no local service found
-	if a.gossipRegistered {
-		// Try by key first
-		if gs := a.gossipServices.GetKey(key); gs != nil {
-			return gs
-		}
-		// Try by address (for VIP lookups)
-		for _, gs := range a.gossipServices.List() {
-			for _, addr := range gs.Service.Addresses {
-				if addr.Network == network && string(addr.Address) == ip {
-					return &gs
-				}
-			}
-		}
+	if gs := a.lookupGossipServiceByKey(key); gs != nil {
+		return gs
+	}
+	// Try by address (for VIP lookups)
+	if gs := a.lookupGossipServiceByAddress(network, ip); gs != nil {
+		return gs
 	}
 
 	return nil
@@ -760,14 +714,7 @@ func (a *index) All() []model.AddressInfo {
 	}
 
 	// Add gossip-federated services and workloads if registered
-	if a.gossipRegistered {
-		for _, s := range a.gossipServices.List() {
-			res = append(res, s.AsAddress)
-		}
-		for _, wl := range a.gossipWorkloads.List() {
-			res = append(res, wl.AsAddress)
-		}
-	}
+	res = append(res, a.allGossipAddresses()...)
 
 	return res
 }
@@ -810,138 +757,6 @@ func (a *index) AllLocalNetworkGlobalServices(key model.WaypointKey) []model.Ser
 		}
 	}
 	return res
-}
-
-// AllLocalNetworkGlobalServicesWithSANs returns all known globally scoped services with
-// SubjectAltNames populated based on the local workloads backing them. This is used for
-// gossip sync so remote clusters know what identities to expect when connecting.
-func (a *index) AllLocalNetworkGlobalServicesWithSANs() []model.ServiceInfo {
-	// Use empty WaypointKey for gossip context - network is only used for debug logging
-	services := a.AllLocalNetworkGlobalServices(model.WaypointKey{})
-
-	// Get mesh config for trust domain
-	meshCfg := a.meshConfig.Get()
-	if meshCfg == nil {
-		log.Warnf("Mesh config not available, returning services without SANs")
-		return services
-	}
-
-	result := make([]model.ServiceInfo, 0, len(services))
-	for _, svc := range services {
-		// Look up workloads backing this service
-		svcKey := svc.Service.Namespace + "/" + svc.Service.Hostname
-		wls := a.workloads.ByServiceKey.Lookup(svcKey)
-
-		if len(wls) == 0 {
-			// No workloads, return service as-is
-			result = append(result, svc)
-			continue
-		}
-
-		// Collect SANs from all workloads backing this service
-		sans := sets.String{}
-		for _, wl := range wls {
-			san := spiffe.MustGenSpiffeURI(meshCfg.MeshConfig, wl.Workload.Namespace, wl.Workload.ServiceAccount)
-			sans.Insert(san)
-		}
-
-		if sans.IsEmpty() {
-			result = append(result, svc)
-			continue
-		}
-
-		// Merge with any existing SANs
-		sans = sans.Union(sets.New(svc.Service.SubjectAltNames...))
-
-		// Clone and update the service
-		newSvcInfo := model.ServiceInfo{
-			Service:      protomarshal.Clone(svc.Service),
-			Scope:        svc.Scope,
-			CreationTime: svc.CreationTime,
-		}
-		newSvcInfo.Service.SubjectAltNames = sans.UnsortedList()
-		result = append(result, newSvcInfo)
-
-		log.Debugf("Added SANs for service %s: %v", svc.Service.Hostname, sans.UnsortedList())
-	}
-
-	return result
-}
-
-// ServiceWithSANs returns a copy of the service with SubjectAltNames populated
-// based on local workloads backing it.
-func (a *index) ServiceWithSANs(svc *model.ServiceInfo) *model.ServiceInfo {
-	if svc == nil || svc.Service == nil {
-		return svc
-	}
-
-	// Get mesh config for trust domain
-	meshCfg := a.meshConfig.Get()
-	if meshCfg == nil {
-		return svc
-	}
-
-	// Look up workloads backing this service
-	svcKey := svc.Service.Namespace + "/" + svc.Service.Hostname
-	wls := a.workloads.ByServiceKey.Lookup(svcKey)
-
-	if len(wls) == 0 {
-		return svc
-	}
-
-	// Collect SANs from all workloads backing this service
-	sans := sets.String{}
-	for _, wl := range wls {
-		san := spiffe.MustGenSpiffeURI(meshCfg.MeshConfig, wl.Workload.Namespace, wl.Workload.ServiceAccount)
-		sans.Insert(san)
-	}
-
-	if sans.IsEmpty() {
-		return svc
-	}
-
-	// Merge with any existing SANs
-	sans = sans.Union(sets.New(svc.Service.SubjectAltNames...))
-
-	// Clone and update the service
-	newSvcInfo := &model.ServiceInfo{
-		Service:      protomarshal.Clone(svc.Service),
-		Scope:        svc.Scope,
-		CreationTime: svc.CreationTime,
-	}
-	newSvcInfo.Service.SubjectAltNames = sans.UnsortedList()
-
-	return newSvcInfo
-}
-
-// RegisterGlobalServiceHandler registers a callback that is invoked when
-// global-scoped services change. This uses KRT's push-based event system.
-func (a *index) RegisterGlobalServiceHandler(f model.GlobalServiceHandler) {
-	a.services.Register(func(e krt.Event[model.ServiceInfo]) {
-		svc := e.Latest()
-		// Only notify for global scope services
-		if svc.Scope != model.Global {
-			return
-		}
-
-		var prev, curr *model.ServiceInfo
-		var event model.Event
-
-		switch e.Event {
-		case controllers.EventAdd:
-			curr = e.New
-			event = model.EventAdd
-		case controllers.EventUpdate:
-			prev = e.Old
-			curr = e.New
-			event = model.EventUpdate
-		case controllers.EventDelete:
-			prev = e.Old
-			event = model.EventDelete
-		}
-
-		f(prev, curr, event)
-	})
 }
 
 // AddressInformation returns all AddressInfo's in the cluster.
@@ -1185,34 +1000,3 @@ func PushXdsAddress[T any](xds model.XDSUpdater, f func(T) string) func(events [
 }
 
 type MeshConfig = meshwatcher.MeshConfigResource
-
-// RegisterGossipCollections registers external collections for gossip-federated services and workloads.
-// This allows gossip-synced remote services to be included in the ambient index's Lookup results.
-// The parameters are typed as any to satisfy model.GossipAmbientIndex interface (avoiding import cycles).
-func (a *index) RegisterGossipCollections(services, workloads any) {
-	svcCol := services.(krt.StaticCollection[model.ServiceInfo])
-	wlCol := workloads.(krt.StaticCollection[model.WorkloadInfo])
-
-	a.gossipServices = svcCol
-	a.gossipWorkloads = wlCol
-	a.gossipRegistered = true
-
-	// Register event handlers to trigger XDS pushes when gossip data changes
-	if a.XDSUpdater != nil {
-		svcCol.RegisterBatch(krt.BatchedEventFilter(
-			func(s model.ServiceInfo) *workloadapi.Service {
-				return s.Service
-			},
-			PushXdsAddress(a.XDSUpdater, model.ServiceInfo.ResourceName),
-		), false)
-
-		wlCol.RegisterBatch(krt.BatchedEventFilter(
-			func(w model.WorkloadInfo) *workloadapi.Workload {
-				return w.Workload
-			},
-			PushXdsAddress(a.XDSUpdater, model.WorkloadInfo.ResourceName),
-		), false)
-	}
-
-	log.Infof("Registered gossip collections with ambient index")
-}
