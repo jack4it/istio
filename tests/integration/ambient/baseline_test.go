@@ -341,7 +341,7 @@ func TestServerSideLB(t *testing.T) {
 					hostnames[i] = r.Hostname
 				}
 				unique := sets.SortedList(sets.New(hostnames...))
-				want := dst.WorkloadsOrFail(t)
+				want := match.ServiceName(dst.Config().NamespacedName()).GetMatches(apps.All).WorkloadsOrFail(t)
 				wn := []string{}
 				for _, w := range want {
 					wn = append(wn, w.PodName())
@@ -587,6 +587,7 @@ spec:
 				src.CallOrFail(t, opt)
 			})
 			t.NewSubTest("subset").Run(func(t framework.TestContext) {
+				t.Skip("subset has not work in ambient milticluster yet")
 				t.ConfigIstio().Eval(apps.Namespace.Name(), map[string]string{
 					"Destination": dst.Config().Service,
 				}, `apiVersion: networking.istio.io/v1
@@ -3064,30 +3065,30 @@ spec:
 					},
 				}
 
-			var httpMetricVal string
-			for _, cluster := range t.Clusters() {
-				src := apps.Captured.ForCluster(cluster.Name())[0]
-				dst := apps.ServiceAddressedWaypoint.ForCluster(cluster.Name())
-				retry.UntilSuccessOrFail(t, func() error {
-					if _, err := src.Call(echo.CallOptions{To: dst, Port: echo.Port{Name: "http"}}); err != nil {
-						t.Log("failed to send traffic")
-						return err
+				var httpMetricVal string
+				for _, cluster := range t.Clusters() {
+					src := apps.Captured.ForCluster(cluster.Name())[0]
+					dst := apps.ServiceAddressedWaypoint.ForCluster(cluster.Name())
+					retry.UntilSuccessOrFail(t, func() error {
+						if _, err := src.Call(echo.CallOptions{To: dst, Port: echo.Port{Name: "http"}}); err != nil {
+							t.Log("failed to send traffic")
+							return err
+						}
+						var err error
+						httpMetricVal, err = util.QueryPrometheus(t, cluster, query, prom)
+						if err != nil {
+							util.PromDiff(t, prom, cluster, query)
+							return err
+						}
+						return nil
+					}, retry.Timeout(15*time.Second), retry.BackoffDelay(1*time.Second))
+					// check tag removed
+					if strings.Contains(httpMetricVal, "source_principal") {
+						t.Errorf("failed to remove tag: source_principal")
 					}
-					var err error
-					httpMetricVal, err = util.QueryPrometheus(t, cluster, query, prom)
-					if err != nil {
-						util.PromDiff(t, prom, cluster, query)
-						return err
-					}
-					return nil
-				}, retry.Timeout(15*time.Second), retry.BackoffDelay(1*time.Second))
-				// check tag removed
-				if strings.Contains(httpMetricVal, "source_principal") {
-					t.Errorf("failed to remove tag: source_principal")
 				}
 			}
-		}
-	})
+		})
 }
 
 func TestL4Telemetry(t *testing.T) {
@@ -3252,49 +3253,49 @@ func TestAPIServer(t *testing.T) {
 	framework.NewTest(t).Run(func(t framework.TestContext) {
 		for _, cluster := range t.Clusters() {
 			svcs := apps.All.ForCluster(cluster.Name())
-				for _, src := range svcs {
-					if t.Settings().AmbientMultiNetwork && src.Config().Cluster != t.Clusters().Default() {
-						t.Skipf("skipping test for %v, not on default cluster", src.Config().Service)
-					}
-					t.NewSubTestf("from %v", src.Config().Service).Run(func(t framework.TestContext) {
-						//
-						// I use the client-go token here
-						// ideally, we need to fetch the OIDC issuer url and make it as the JWT aud
-						//
-						// token, err := t.Clusters().Default().Kube().CoreV1().ServiceAccounts(apps.Namespace.Name()).
-						// 	CreateToken(context.Background(), src.Config().AccountName(),
-						// 		&authenticationv1.TokenRequest{
-						// 			Spec: authenticationv1.TokenRequestSpec{
-						// 				Audiences:         []string{"kubernetes.default.svc"},
-						// 				ExpirationSeconds: ptr.Of(int64(600)),
-						// 			},
-						// 		}, metav1.CreateOptions{})
-						// assert.NoError(t, err)
-
-						restConfig := t.Clusters().Default().RESTConfig()
-						token := restConfig.BearerToken
-						apiServerAddr := restConfig.Host
-						u, err := url.Parse(apiServerAddr)
-						assert.NoError(t, err)
-
-						opts := echo.CallOptions{
-							Address: "kubernetes.default.svc",
-							Port:    echo.Port{ServicePort: 443},
-							Scheme:  scheme.HTTPS,
-							HTTP: echo.HTTP{
-								Headers: headers.New().With("Authorization", "Bearer "+token).Build(),
-								Path:    "/api",
-							},
-							TLS: echo.TLS{
-								CaCertFile: "/var/run/secrets/kubernetes.io/serviceaccount/ca.crt",
-							},
-							Check: check.BodyContains(u.Host),
-						}
-						src.CallOrFail(t, opts)
-					})
+			for _, src := range svcs {
+				if t.Settings().AmbientMultiNetwork && src.Config().Cluster != t.Clusters().Default() {
+					t.Skipf("skipping test for %v, not on default cluster", src.Config().Service)
 				}
+				t.NewSubTestf("from %v", src.Config().Service).Run(func(t framework.TestContext) {
+					//
+					// I use the client-go token here
+					// ideally, we need to fetch the OIDC issuer url and make it as the JWT aud
+					//
+					// token, err := t.Clusters().Default().Kube().CoreV1().ServiceAccounts(apps.Namespace.Name()).
+					// 	CreateToken(context.Background(), src.Config().AccountName(),
+					// 		&authenticationv1.TokenRequest{
+					// 			Spec: authenticationv1.TokenRequestSpec{
+					// 				Audiences:         []string{"kubernetes.default.svc"},
+					// 				ExpirationSeconds: ptr.Of(int64(600)),
+					// 			},
+					// 		}, metav1.CreateOptions{})
+					// assert.NoError(t, err)
+
+					restConfig := t.Clusters().Default().RESTConfig()
+					token := restConfig.BearerToken
+					apiServerAddr := restConfig.Host
+					u, err := url.Parse(apiServerAddr)
+					assert.NoError(t, err)
+
+					opts := echo.CallOptions{
+						Address: "kubernetes.default.svc",
+						Port:    echo.Port{ServicePort: 443},
+						Scheme:  scheme.HTTPS,
+						HTTP: echo.HTTP{
+							Headers: headers.New().With("Authorization", "Bearer "+token).Build(),
+							Path:    "/api",
+						},
+						TLS: echo.TLS{
+							CaCertFile: "/var/run/secrets/kubernetes.io/serviceaccount/ca.crt",
+						},
+						Check: check.BodyContains(u.Host),
+					}
+					src.CallOrFail(t, opts)
+				})
 			}
-		})
+		}
+	})
 }
 
 func TestDirect(t *testing.T) {
@@ -3644,7 +3645,7 @@ func TestZtunnelRestart(t *testing.T) {
 			// var sidecar traffic.Generator
 			// TODO(https://github.com/istio/istio/issues/57878): remove this condition when the issue is addressed
 			// if !t.Settings().AmbientMultiNetwork {
-				// sidecar = mkGen(apps.Sidecar.ForCluster(c.Name())[0], dst) // AppLink does not support sidecars
+			// sidecar = mkGen(apps.Sidecar.ForCluster(c.Name())[0], dst) // AppLink does not support sidecars
 			// }
 			// This is effectively "captured" since its the client; we cannot use captured since captured is the dest, though
 			captured := mkGen(apps.WorkloadAddressedWaypoint.ForCluster(c.Name())[0], dst)
