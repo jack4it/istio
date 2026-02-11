@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-package gossip
+package federation
 
 import (
 	"sync"
@@ -30,7 +30,7 @@ const (
 	tombstonePruneInterval = 1 * time.Minute
 )
 
-var tombstoneLog = log.RegisterScope("gossip-tombstone", "Gossip tombstone manager")
+var tombstoneLog = log.RegisterScope("federation-tombstone", "Federation tombstone manager")
 
 // tombstoneStore manages deletion markers to prevent resurrection of deleted
 // resources from stale peers.

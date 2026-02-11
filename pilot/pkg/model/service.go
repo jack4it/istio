@@ -941,15 +941,15 @@ type ServiceDiscovery interface {
 // The handler receives the old and new ServiceInfo and the event type.
 type GlobalServiceHandler func(prev, curr *ServiceInfo, event Event)
 
-// GossipAmbientIndex is the interface for gossip integration with the ambient index.
-// It combines collection registration with service access for the gossip sync protocol.
+// FederationAmbientIndex is the interface for federation integration with the ambient index.
+// It combines collection registration with service access for the federation sync protocol.
 // Note: The collection parameters use any to avoid import cycles with krt package.
 // Implementations should accept krt.StaticCollection[ServiceInfo] and krt.StaticCollection[WorkloadInfo].
-type GossipAmbientIndex interface {
-	// RegisterGossipCollections registers gossip service/workload collections with the ambient index.
-	RegisterGossipCollections(services, workloads any)
+type FederationAmbientIndex interface {
+	// RegisterFederationCollections registers federation service/workload collections with the ambient index.
+	RegisterFederationCollections(services, workloads any)
 	// AllLocalNetworkGlobalServicesWithSANs returns global services with SubjectAltNames populated
-	// based on local workloads. This is used for gossip sync so remote clusters know what
+	// based on local workloads. This is used for federation sync so remote clusters know what
 	// identities to expect when connecting to workloads behind these services.
 	AllLocalNetworkGlobalServicesWithSANs() []ServiceInfo
 	// ServiceWithSANs returns a copy of the service with SubjectAltNames populated

@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-package gossip
+package federation
 
 import (
 	"google.golang.org/protobuf/proto"
@@ -23,7 +23,7 @@ import (
 	"istio.io/istio/pkg/workloadapi"
 )
 
-// SyncMessage represents a gossip synchronization message between istiod peers.
+// SyncMessage represents a federation synchronization message between istiod peers.
 // Note: We use a wire-friendly format (WireServiceInfo) for serialization because
 // model.ServiceInfo contains protobuf types that don't serialize cleanly with JSON.
 type SyncMessage struct {
@@ -70,7 +70,7 @@ type WireServiceInfo struct {
 	Scope model.ServiceScope `json:"scope,omitempty"`
 }
 
-// WireNetworkGateway represents network gateway information synced via gossip.
+// WireNetworkGateway represents network gateway information synced via federation.
 type WireNetworkGateway struct {
 	// Network is the network ID this gateway serves.
 	Network string `json:"network"`

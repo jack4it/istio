@@ -12,11 +12,10 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-package gossip
+package federation
 
 import (
 	"fmt"
-	"strings"
 	"time"
 
 	"istio.io/istio/pilot/pkg/model"
@@ -26,35 +25,16 @@ import (
 	"istio.io/istio/pkg/network"
 )
 
-var syncLog = log.RegisterScope("gossip-sync", "Gossip sync protocol")
+var syncLog = log.RegisterScope("federation-sync", "Federation sync protocol")
 
-// nodeSuffix is appended to cluster ID to form the Serf node name.
-const nodeSuffix = "-istiod"
-
-// NodeName returns the Serf node name for a given cluster ID.
-// This ensures consistent naming across the codebase.
-func NodeName(clusterID cluster.ID) string {
-	return string(clusterID) + nodeSuffix
-}
-
-// extractClusterID extracts the cluster ID from a peer node name.
-// Node names are formatted as "{clusterID}-istiod".
-func extractClusterID(peerName string) cluster.ID {
-	if strings.HasSuffix(peerName, nodeSuffix) {
-		return cluster.ID(strings.TrimSuffix(peerName, nodeSuffix))
-	}
-	// Fallback: return the whole name if format doesn't match
-	return cluster.ID(peerName)
-}
-
-// SyncProtocol handles the synchronization protocol between peers.
-// It broadcasts local service changes to peers and processes incoming messages.
+// SyncProtocol handles the synchronization protocol between istiod peers.
+// It broadcasts local service changes via Service Bus and processes incoming messages.
 type SyncProtocol struct {
-	// store is the internal data store for gossip-synced services.
-	store *gossipStore
+	// store holds synced remote services from other clusters.
+	store *federationStore
 
-	// serfCluster handles peer connections and messaging.
-	serfCluster *serfCluster
+	// transport handles message delivery via Azure Service Bus.
+	transport *ServiceBusTransport
 
 	// localClusterID is the local cluster's ID.
 	localClusterID cluster.ID
@@ -65,26 +45,23 @@ type SyncProtocol struct {
 	// tombstones manages deletion markers for outbound sync.
 	tombstones *tombstoneStore
 
-	// ambientIndexGetter returns the ambient index for:
-	// - Registering gossip collections
-	// - Getting local global services to broadcast
-	// - Receiving service change notifications
+	// ambientIndexGetter returns the ambient index.
 	// This is a getter because the index may not be available at construction time.
-	ambientIndexGetter func() model.GossipAmbientIndex
+	ambientIndexGetter func() model.FederationAmbientIndex
 
 	// ambientIndex is the cached ambient index once retrieved.
-	ambientIndex model.GossipAmbientIndex
+	ambientIndex model.FederationAmbientIndex
 
-	// gossipServices holds gossip-federated services for ambient index integration.
-	gossipServices krt.StaticCollection[model.ServiceInfo]
+	// federationServices holds federated remote services for ambient index integration.
+	federationServices krt.StaticCollection[model.ServiceInfo]
 
-	// gossipWorkloads holds gossip-federated workloads for ambient index integration.
-	gossipWorkloads krt.StaticCollection[model.WorkloadInfo]
+	// federationWorkloads holds federated remote workloads for ambient index integration.
+	federationWorkloads krt.StaticCollection[model.WorkloadInfo]
 
 	// localNetworkGatewayGetter returns the local network gateway.
 	localNetworkGatewayGetter func() *model.NetworkGateway
 
-	// xdsUpdater triggers XDS pushes when gossip collections change.
+	// xdsUpdater triggers XDS pushes when federation collections change.
 	xdsUpdater model.XDSUpdater
 
 	// stopCh signals shutdown.
@@ -96,16 +73,15 @@ type SyncProtocolConfig struct {
 	LocalClusterID cluster.ID
 
 	// AmbientIndexGetter returns the ambient index for direct integration.
-	// This is a getter to support deferred initialization - the ambient index
+	// This is a getter to support deferred initialization — the ambient index
 	// may not be available until after the k8s registry is fully registered.
-	// Used to register gossip collections and access local global services.
-	AmbientIndexGetter func() model.GossipAmbientIndex
+	AmbientIndexGetter func() model.FederationAmbientIndex
 
 	// LocalNetworkGatewayGetter returns the local cluster's network gateway.
 	// This is synced to remote clusters so they can route traffic back.
 	LocalNetworkGatewayGetter func() *model.NetworkGateway
 
-	// XDSUpdater triggers XDS pushes when gossip collections change.
+	// XDSUpdater triggers XDS pushes when federation collections change.
 	// This is required to notify ztunnel about new services/workloads.
 	XDSUpdater model.XDSUpdater
 
@@ -113,20 +89,19 @@ type SyncProtocolConfig struct {
 	// Used to set the trust domain on split-horizon workloads for HBONE mTLS.
 	TrustDomainGetter func() string
 
-	// Gossip networking configuration
-	NodeName      string
-	BindAddr      string
-	BindPort      int
-	AdvertiseAddr string
-	AdvertisePort int
-	EncryptionKey []byte
+	// Transport is the Service Bus transport for federation messaging.
+	Transport *ServiceBusTransport
 
 	StopCh chan struct{}
 }
 
 // NewSyncProtocol creates a new sync protocol handler.
-// Note: Call Start() to begin gossip networking and register with service controllers.
+// Note: Call Start() to begin receiving/publishing messages.
 func NewSyncProtocol(cfg SyncProtocolConfig) (*SyncProtocol, error) {
+	if cfg.Transport == nil {
+		return nil, fmt.Errorf("Transport is required")
+	}
+
 	// Create internal components for tracking outbound sync state
 	versionVector := newVersionVector()
 	tombstones := newTombstoneStore(cfg.StopCh)
@@ -143,26 +118,26 @@ func NewSyncProtocol(cfg SyncProtocolConfig) (*SyncProtocol, error) {
 		return gw.Network
 	}
 
-	// Create the gossip store for holding synced remote services
-	store := newGossipStore(gossipStoreConfig{
+	// Create the federation store for holding synced remote services
+	store := newFederationStore(federationStoreConfig{
 		LocalClusterID:     cfg.LocalClusterID,
 		TrustDomainGetter:  cfg.TrustDomainGetter,
 		LocalNetworkGetter: localNetworkGetter,
 		StopCh:             cfg.StopCh,
 	})
 
-	// Create KRT StaticCollections for gossip services and workloads.
+	// Create KRT StaticCollections for federation services and workloads.
 	// These will be registered with the ambient index for lookup integration.
-	gossipServices := krt.NewStaticCollection[model.ServiceInfo](
+	federationServices := krt.NewStaticCollection[model.ServiceInfo](
 		nil, // synced - will be set when initial sync completes
 		nil, // initial values
-		krt.WithName("GossipServices"),
+		krt.WithName("FederationServices"),
 		krt.WithStop(cfg.StopCh),
 	)
-	gossipWorkloads := krt.NewStaticCollection[model.WorkloadInfo](
+	federationWorkloads := krt.NewStaticCollection[model.WorkloadInfo](
 		nil, // synced
 		nil, // initial values
-		krt.WithName("GossipWorkloads"),
+		krt.WithName("FederationWorkloads"),
 		krt.WithStop(cfg.StopCh),
 	)
 
@@ -172,73 +147,51 @@ func NewSyncProtocol(cfg SyncProtocolConfig) (*SyncProtocol, error) {
 		versionVector:             versionVector,
 		tombstones:                tombstones,
 		ambientIndexGetter:        cfg.AmbientIndexGetter,
-		gossipServices:            gossipServices,
-		gossipWorkloads:           gossipWorkloads,
+		federationServices:        federationServices,
+		federationWorkloads:       federationWorkloads,
 		localNetworkGatewayGetter: cfg.LocalNetworkGatewayGetter,
 		xdsUpdater:                cfg.XDSUpdater,
 		stopCh:                    cfg.StopCh,
+		transport:                 cfg.Transport,
 	}
 
-	// Create Serf cluster with handlers
-	serfCfg := serfConfig{
-		NodeName:      cfg.NodeName,
-		ClusterID:     cfg.LocalClusterID,
-		BindAddr:      cfg.BindAddr,
-		BindPort:      cfg.BindPort,
-		AdvertiseAddr: cfg.AdvertiseAddr,
-		AdvertisePort: cfg.AdvertisePort,
-		MessageHandler: func(msg *SyncMessage) {
-			sp.handleIncomingMessage(msg)
-		},
-		MemberJoinHandler: func(peerName string) {
-			sp.handlePeerConnect(peerName)
-		},
-		MemberLeaveHandler: func(peerName string) {
-			sp.handlePeerDisconnect(peerName)
-		},
-		EncryptionKey: cfg.EncryptionKey,
-		StopCh:        cfg.StopCh,
-	}
+	// Late-bind the message handler — the transport is constructed before
+	// SyncProtocol exists (in bootstrap), so it receives the handler here.
+	cfg.Transport.SetMessageHandler(func(msg *SyncMessage) {
+		sp.handleIncomingMessage(msg)
+	})
 
-	sc, err := newSerfCluster(serfCfg)
-	if err != nil {
-		return nil, fmt.Errorf("failed to create serf cluster: %w", err)
-	}
-
-	// Wire up the full sync builder
-	sc.setFullSyncBuilder(sp.buildFullSyncMessage)
-	sp.serfCluster = sc
+	// Wire up the full sync builder for periodic snapshots
+	cfg.Transport.SetFullSyncBuilder(sp.buildFullSyncMessage)
 
 	return sp, nil
 }
 
-// Start begins gossip networking, registers for service change events,
-// and registers gossip collections with the ambient index.
+// Start begins federation messaging, registers for service change events,
+// and registers federation collections with the ambient index.
 // The order is important to avoid races:
-// 1. Start serf cluster (so we can send/receive messages)
-// 2. Register gossip collections with ambient index
+// 1. Start transport (so we can send/receive messages)
+// 2. Register federation collections with ambient index
 // 3. Register for service change events (so we can broadcast changes)
 // 4. Send initial full sync (after collections have populated)
 func (sp *SyncProtocol) Start() error {
-	// 1. Start serf cluster first - must be running before we can broadcast
-	if err := sp.serfCluster.start(); err != nil {
-		return fmt.Errorf("failed to start serf cluster: %w", err)
+	// 1. Start transport first — must be running before we can broadcast
+	if err := sp.transport.Start(); err != nil {
+		return fmt.Errorf("failed to start transport: %w", err)
 	}
-	syncLog.Info("Serf cluster started")
+	syncLog.Info("Transport started")
 
-	// Get ambient index - may be nil if not yet available or not enabled
+	// Get ambient index — may be nil if not yet available or not enabled
 	if sp.ambientIndexGetter != nil {
 		sp.ambientIndex = sp.ambientIndexGetter()
 	}
 
 	if sp.ambientIndex != nil {
-		// 2. Register gossip collections with ambient index
-		// This enables gossip services/workloads to be included in ambient lookups
-		sp.ambientIndex.RegisterGossipCollections(sp.gossipServices, sp.gossipWorkloads)
-		syncLog.Info("Registered gossip collections with ambient index")
+		// 2. Register federation collections with ambient index
+		sp.ambientIndex.RegisterFederationCollections(sp.federationServices, sp.federationWorkloads)
+		syncLog.Info("Registered federation collections with ambient index")
 
 		// 3. Register for push-based global service change events
-		// Now that serf is running, we can safely broadcast changes
 		sp.ambientIndex.RegisterGlobalServiceHandler(func(prev, curr *model.ServiceInfo, event model.Event) {
 			switch event {
 			case model.EventAdd:
@@ -247,34 +200,21 @@ func (sp *SyncProtocol) Start() error {
 				sp.handleServiceUpdate(curr)
 			case model.EventDelete:
 				if prev != nil && prev.Service != nil {
-					// Use hostname as the key (same as store.go)
 					sp.handleServiceDelete(prev.Service.Hostname)
 				}
 			}
 		})
 		syncLog.Info("Registered for push-based global service events")
 
-		// 4. Send initial full sync now that everything is registered.
-		// This catches any services that were already in the collection when
-		// the handler was registered (since KRT only fires events for changes).
-		// This is a goroutine to avoid blocking Start() - services may still be syncing.
+		// 4. Send initial full sync after a short delay for KRT to populate.
 		go func() {
-			// Wait for peers to establish connections before sending full sync.
-			// The memberlist needs time to complete UDP/TCP handshakes.
-			for i := 0; i < 12; i++ { // Wait up to 60 seconds total
-				time.Sleep(5 * time.Second)
-				peerCount := sp.serfCluster.memberCount()
-				syncLog.Infof("Checking peer status: %d peers connected", peerCount)
-				if peerCount > 1 { // At least one peer besides ourselves
-					break
-				}
-			}
-			syncLog.Info("Sending delayed initial full sync after KRT population")
+			time.Sleep(10 * time.Second)
+			syncLog.Info("Sending initial full sync")
 			msg := sp.buildFullSyncMessage()
 			sp.broadcast(msg)
 		}()
 	} else {
-		syncLog.Warn("No ambient index available - gossip sync will only exchange peer metadata")
+		syncLog.Warn("No ambient index available — federation sync will only exchange peer metadata")
 	}
 
 	syncLog.Info("Sync protocol started")
@@ -283,46 +223,14 @@ func (sp *SyncProtocol) Start() error {
 
 // Stop gracefully stops the sync protocol.
 func (sp *SyncProtocol) Stop() error {
-	if err := sp.serfCluster.leave(); err != nil {
-		syncLog.Warnf("Error leaving serf cluster: %v", err)
-	}
-	return sp.serfCluster.shutdown()
+	return sp.transport.Shutdown()
 }
 
-// broadcast sends a sync message to all connected peers.
+// broadcast sends a sync message to all peers via Service Bus.
 func (sp *SyncProtocol) broadcast(msg *SyncMessage) {
-	if err := sp.serfCluster.broadcastServiceSync(msg); err != nil {
+	if err := sp.transport.Broadcast(msg); err != nil {
 		syncLog.Warnf("Failed to broadcast message: %v", err)
 	}
-}
-
-// handlePeerConnect is called when a new peer connects.
-// It sends a full sync message with all local global services.
-func (sp *SyncProtocol) handlePeerConnect(peerName string) {
-	syncLog.Infof("Peer connected: %s, sending full sync", peerName)
-
-	msg := sp.buildFullSyncMessage()
-	sp.broadcast(msg)
-}
-
-// handlePeerDisconnect is called when a peer leaves or fails.
-// For now we just log it - services remain in the registry since the peer may rejoin.
-// Future enhancement: track stale clusters and clean up after extended absence.
-func (sp *SyncProtocol) handlePeerDisconnect(peerName string) {
-	// Extract cluster ID from peer name (format: "{clusterID}-istiod")
-	peerClusterID := extractClusterID(peerName)
-
-	syncLog.Warnf("Peer disconnected: %s (cluster=%s) - services retained pending reconnection",
-		peerName, peerClusterID)
-
-	// Note: We intentionally don't remove services here.
-	// The peer might rejoin shortly (network blip, pod restart, etc.).
-	// Removing services immediately could cause unnecessary traffic disruption.
-	//
-	// For production, consider:
-	// 1. Starting a timer to mark services stale after extended absence
-	// 2. Notifying the registry to flag services from this cluster
-	// 3. Cleaning up only after confirmed permanent departure
 }
 
 // getLocalNetworkGateway returns the local network gateway info for syncing.
@@ -468,17 +376,17 @@ func (sp *SyncProtocol) handleIncomingMessage(msg *SyncMessage) {
 	sp.store.handleSyncMessage(msg)
 
 	// Update KRT collections with the new state from the store
-	services, workloads := sp.store.getGossipState()
-	sp.gossipServices.Reset(services)
-	sp.gossipWorkloads.Reset(workloads)
-	syncLog.Infof("Updated gossip collections: %d services, %d workloads", len(services), len(workloads))
+	services, workloads := sp.store.getFederationState()
+	sp.federationServices.Reset(services)
+	sp.federationWorkloads.Reset(workloads)
+	syncLog.Infof("Updated federation collections: %d services, %d workloads", len(services), len(workloads))
 
 	// Trigger XDS push to notify ztunnel about new services/workloads
 	if sp.xdsUpdater != nil && (len(services) > 0 || len(workloads) > 0) {
 		sp.xdsUpdater.ConfigUpdate(&model.PushRequest{
 			Full:   true,
-			Reason: model.NewReasonStats(model.GossipUpdate),
+			Reason: model.NewReasonStats(model.FederationUpdate),
 		})
-		syncLog.Debugf("Triggered XDS push for gossip update")
+		syncLog.Debugf("Triggered XDS push for federation update")
 	}
 }

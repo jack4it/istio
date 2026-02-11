@@ -63,7 +63,7 @@ type Index interface {
 	Run(stop <-chan struct{})
 	HasSynced() bool
 	model.AmbientIndexes
-	model.GossipAmbientIndex
+	model.FederationAmbientIndex
 }
 
 var _ Index = &index{}
@@ -137,9 +137,9 @@ type index struct {
 	remoteClientConfigOverrides []func(*rest.Config)
 	builder                     Builder
 
-	// gossip holds gossip-federated external services/workloads state.
-	// Populated by the gossip registry when enabled.
-	gossip gossipIndex
+	// federation holds federation-synced external services/workloads state.
+	// Populated by the federation sync protocol when enabled.
+	federation federationIndex
 }
 
 type FeatureFlags struct {
@@ -625,8 +625,8 @@ func (a *index) Lookup(key string) []model.AddressInfo {
 		return []model.AddressInfo{w.AsAddress}
 	}
 
-	// 1b. Workload UID (gossip workloads)
-	if w := a.lookupGossipWorkloadByKey(key); w != nil {
+	// 1b. Workload UID (federation workloads)
+	if w := a.lookupFederationWorkloadByKey(key); w != nil {
 		return []model.AddressInfo{w.AsAddress}
 	}
 
@@ -650,14 +650,14 @@ func (a *index) Lookup(key string) []model.AddressInfo {
 		for _, w := range a.workloads.ByServiceKey.Lookup(svc.ResourceName()) {
 			res = append(res, w.AsAddress)
 		}
-		// Also check gossip workloads for this service
-		res = append(res, a.lookupGossipWorkloadsForService(svc.ResourceName())...)
+		// Also check federation workloads for this service
+		res = append(res, a.lookupFederationWorkloadsForService(svc.ResourceName())...)
 		return res
 	}
 
-	// 4. Check gossip collections if no local match found
-	if gossipRes := a.lookupGossip(key); len(gossipRes) > 0 {
-		return gossipRes
+	// 4. Check federation collections if no local match found
+	if fedRes := a.lookupFederation(key); len(fedRes) > 0 {
+		return fedRes
 	}
 
 	return nil
@@ -680,12 +680,12 @@ func (a *index) lookupService(key string) *model.ServiceInfo {
 		return svc
 	}
 
-	// 3. Check gossip services if no local service found
-	if gs := a.lookupGossipServiceByKey(key); gs != nil {
+	// 3. Check federation services if no local service found
+	if gs := a.lookupFederationServiceByKey(key); gs != nil {
 		return gs
 	}
 	// Try by address (for VIP lookups)
-	if gs := a.lookupGossipServiceByAddress(network, ip); gs != nil {
+	if gs := a.lookupFederationServiceByAddress(network, ip); gs != nil {
 		return gs
 	}
 
@@ -713,8 +713,8 @@ func (a *index) All() []model.AddressInfo {
 		res = append(res, s.AsAddress)
 	}
 
-	// Add gossip-federated services and workloads if registered
-	res = append(res, a.allGossipAddresses()...)
+	// Add federation-synced services and workloads if registered
+	res = append(res, a.allFederationAddresses()...)
 
 	return res
 }

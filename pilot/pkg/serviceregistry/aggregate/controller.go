@@ -190,12 +190,12 @@ func (c *Controller) ServiceInfo(key string) *model.ServiceInfo {
 // AmbientIndexGetter is an optional interface that registries can implement to expose their ambient index.
 type AmbientIndexGetter interface {
 	// AmbientIndex returns the ambient index for this registry, or nil if ambient is not enabled.
-	AmbientIndex() model.GossipAmbientIndex
+	AmbientIndex() model.FederationAmbientIndex
 }
 
 // GetAmbientIndex returns the ambient index from the config cluster's registry, if available.
-// This provides direct access to the ambient index for gossip integration.
-func (c *Controller) GetAmbientIndex() model.GossipAmbientIndex {
+// This provides direct access to the ambient index for federation integration.
+func (c *Controller) GetAmbientIndex() model.FederationAmbientIndex {
 	if !features.EnableAmbient {
 		return nil
 	}

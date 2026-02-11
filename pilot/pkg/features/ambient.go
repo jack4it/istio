@@ -15,6 +15,8 @@
 package features
 
 import (
+	"time"
+
 	"istio.io/istio/pkg/env"
 	"istio.io/istio/pkg/log"
 )
@@ -77,21 +79,27 @@ var (
 		false,
 		"If enabled, selector based authorization policies will be enforced as L4 policies in front of the waypoint.").Get()
 
-	EnableGossipFederation = registerAmbient("PILOT_ENABLE_GOSSIP_FEDERATION", false, false,
-		"If enabled, istiod will use gossip-based federation to synchronize ambient global services with peer istiod instances.")
+	FederationLocalNetwork = env.Register("PILOT_FEDERATION_LOCAL_NETWORK", "",
+		"The network ID of the local cluster for federation. Used to identify which network gateway to sync.").Get()
 
-	GossipPeers = env.Register("PILOT_GOSSIP_PEERS", "",
-		"Comma-separated list of peer istiod addresses (host:port) for cross-cluster gossip federation. "+
-			"If empty, peers are discovered via istiod Service endpoints.").Get()
+	EnableFederation = registerAmbient("PILOT_ENABLE_FEDERATION", false, false,
+		"If enabled, istiod will use Azure Service Bus pub/sub to synchronize ambient global services with peer istiod instances.")
 
-	GossipBindPort = env.Register("PILOT_GOSSIP_BIND_PORT", 7946,
-		"The port to bind for gossip protocol communication between istiod peers.").Get()
+	ServiceBusConnectionString = env.Register("PILOT_SERVICEBUS_CONNECTION_STRING", "",
+		"Azure Service Bus connection string. If empty, Azure Workload Identity (DefaultAzureCredential) is used.").Get()
 
-	GossipAdvertiseAddr = env.Register("PILOT_GOSSIP_ADVERTISE_ADDR", "",
-		"The address to advertise to other istiod peers for gossip. If empty, the bind address is used.").Get()
+	ServiceBusNamespace = env.Register("PILOT_SERVICEBUS_NAMESPACE", "",
+		"Fully qualified Azure Service Bus namespace (e.g., 'istio-fed.servicebus.windows.net'). "+
+			"Used when authenticating via Workload Identity instead of connection string.").Get()
 
-	GossipLocalNetwork = env.Register("PILOT_GOSSIP_LOCAL_NETWORK", "",
-		"The network ID of the local cluster for gossip federation. Used to identify which network gateway to sync.").Get()
+	ServiceBusTopic = env.Register("PILOT_SERVICEBUS_TOPIC", "istio-service-sync",
+		"The Service Bus topic name for federation sync messages.").Get()
+
+	ServiceBusSubscription = env.Register("PILOT_SERVICEBUS_SUBSCRIPTION", "",
+		"This cluster's subscription name on the Service Bus topic. Should be unique per cluster (defaults to cluster ID).").Get()
+
+	ServiceBusSnapshotInterval = env.Register("PILOT_SERVICEBUS_SNAPSHOT_INTERVAL", 5*time.Minute,
+		"How often to publish a full-sync snapshot to Service Bus for cold-start bootstrap of new istiod instances.").Get()
 )
 
 // registerAmbient registers a variable that is allowed only if EnableAmbient is set

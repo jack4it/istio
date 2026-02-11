@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-package gossip
+package federation
 
 import (
 	"fmt"
@@ -239,7 +239,7 @@ func (s *federationStore) getFederationState() ([]model.ServiceInfo, []model.Wor
 }
 
 // createSplitHorizonWorkload creates a synthetic workload that routes to a network gateway.
-// This enables cross-network traffic routing for services discovered via gossip.
+// This enables cross-network traffic routing for services discovered via federation.
 func (s *federationStore) createSplitHorizonWorkload(svcInfo *model.ServiceInfo, gateway model.NetworkGateway) *model.WorkloadInfo {
 	if svcInfo == nil || svcInfo.Service == nil {
 		return nil

@@ -718,7 +718,7 @@ func (c *Controller) Stop() {
 // AmbientIndex returns the ambient index for this controller.
 // Returns nil if ambient is not enabled.
 // This satisfies aggregate.AmbientIndexGetter interface.
-func (c *Controller) AmbientIndex() model.GossipAmbientIndex {
+func (c *Controller) AmbientIndex() model.FederationAmbientIndex {
 	if c.ambientIndex == nil {
 		return nil
 	}

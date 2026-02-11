@@ -25,39 +25,39 @@ import (
 	"istio.io/istio/pkg/workloadapi"
 )
 
-// gossipIndex encapsulates gossip-federated services and workloads state.
-// These are populated by the gossip registry when enabled.
-type gossipIndex struct {
+// federationIndex encapsulates federation-synced services and workloads state.
+// These are populated by the federation sync protocol when enabled.
+type federationIndex struct {
 	services   krt.StaticCollection[model.ServiceInfo]
 	workloads  krt.StaticCollection[model.WorkloadInfo]
 	registered bool
 }
 
-// lookupGossip checks gossip collections for services and workloads.
-func (a *index) lookupGossip(key string) []model.AddressInfo {
-	if !a.gossip.registered {
+// lookupFederation checks federation collections for services and workloads.
+func (a *index) lookupFederation(key string) []model.AddressInfo {
+	if !a.federation.registered {
 		return nil
 	}
 
 	// Try service lookup by key (namespace/hostname)
-	if svc := a.gossip.services.GetKey(key); svc != nil {
+	if svc := a.federation.services.GetKey(key); svc != nil {
 		res := []model.AddressInfo{svc.AsAddress}
 		// Also get workloads for this service
-		res = append(res, a.lookupGossipWorkloadsForService(svc.ResourceName())...)
+		res = append(res, a.lookupFederationWorkloadsForService(svc.ResourceName())...)
 		return res
 	}
 
 	return nil
 }
 
-// lookupGossipWorkloadsForService returns gossip workloads that serve the given service.
-func (a *index) lookupGossipWorkloadsForService(serviceKey string) []model.AddressInfo {
-	if !a.gossip.registered {
+// lookupFederationWorkloadsForService returns federation workloads that serve the given service.
+func (a *index) lookupFederationWorkloadsForService(serviceKey string) []model.AddressInfo {
+	if !a.federation.registered {
 		return nil
 	}
 
 	var res []model.AddressInfo
-	for _, w := range a.gossip.workloads.List() {
+	for _, w := range a.federation.workloads.List() {
 		// Check if this workload serves the requested service
 		if _, ok := w.Workload.Services[serviceKey]; ok {
 			res = append(res, w.AsAddress)
@@ -66,28 +66,28 @@ func (a *index) lookupGossipWorkloadsForService(serviceKey string) []model.Addre
 	return res
 }
 
-// lookupGossipWorkloadByKey returns a gossip workload by its key (UID).
-func (a *index) lookupGossipWorkloadByKey(key string) *model.WorkloadInfo {
-	if !a.gossip.registered {
+// lookupFederationWorkloadByKey returns a federation workload by its key (UID).
+func (a *index) lookupFederationWorkloadByKey(key string) *model.WorkloadInfo {
+	if !a.federation.registered {
 		return nil
 	}
-	return a.gossip.workloads.GetKey(key)
+	return a.federation.workloads.GetKey(key)
 }
 
-// lookupGossipServiceByKey returns a gossip service by its key (namespace/hostname).
-func (a *index) lookupGossipServiceByKey(key string) *model.ServiceInfo {
-	if !a.gossip.registered {
+// lookupFederationServiceByKey returns a federation service by its key (namespace/hostname).
+func (a *index) lookupFederationServiceByKey(key string) *model.ServiceInfo {
+	if !a.federation.registered {
 		return nil
 	}
-	return a.gossip.services.GetKey(key)
+	return a.federation.services.GetKey(key)
 }
 
-// lookupGossipServiceByAddress returns a gossip service by network/ip address.
-func (a *index) lookupGossipServiceByAddress(network, ip string) *model.ServiceInfo {
-	if !a.gossip.registered {
+// lookupFederationServiceByAddress returns a federation service by network/ip address.
+func (a *index) lookupFederationServiceByAddress(network, ip string) *model.ServiceInfo {
+	if !a.federation.registered {
 		return nil
 	}
-	for _, gs := range a.gossip.services.List() {
+	for _, gs := range a.federation.services.List() {
 		for _, addr := range gs.Service.Addresses {
 			if addr.Network == network && string(addr.Address) == ip {
 				return &gs
@@ -97,17 +97,17 @@ func (a *index) lookupGossipServiceByAddress(network, ip string) *model.ServiceI
 	return nil
 }
 
-// allGossipAddresses returns all gossip-federated services and workloads as AddressInfo.
-func (a *index) allGossipAddresses() []model.AddressInfo {
-	if !a.gossip.registered {
+// allFederationAddresses returns all federation-synced services and workloads as AddressInfo.
+func (a *index) allFederationAddresses() []model.AddressInfo {
+	if !a.federation.registered {
 		return nil
 	}
 
 	var res []model.AddressInfo
-	for _, s := range a.gossip.services.List() {
+	for _, s := range a.federation.services.List() {
 		res = append(res, s.AsAddress)
 	}
-	for _, wl := range a.gossip.workloads.List() {
+	for _, wl := range a.federation.workloads.List() {
 		res = append(res, wl.AsAddress)
 	}
 	return res
@@ -115,9 +115,9 @@ func (a *index) allGossipAddresses() []model.AddressInfo {
 
 // AllLocalNetworkGlobalServicesWithSANs returns all known globally scoped services with
 // SubjectAltNames populated based on the local workloads backing them. This is used for
-// gossip sync so remote clusters know what identities to expect when connecting.
+// federation sync so remote clusters know what identities to expect when connecting.
 func (a *index) AllLocalNetworkGlobalServicesWithSANs() []model.ServiceInfo {
-	// Use empty WaypointKey for gossip context - network is only used for debug logging
+	// Use empty WaypointKey for federation context - network is only used for debug logging
 	services := a.AllLocalNetworkGlobalServices(model.WaypointKey{})
 
 	// Get mesh config for trust domain
@@ -245,18 +245,18 @@ func (a *index) RegisterGlobalServiceHandler(f model.GlobalServiceHandler) {
 	})
 }
 
-// RegisterGossipCollections registers external collections for gossip-federated services and workloads.
-// This allows gossip-synced remote services to be included in the ambient index's Lookup results.
-// The parameters are typed as any to satisfy model.GossipAmbientIndex interface (avoiding import cycles).
-func (a *index) RegisterGossipCollections(services, workloads any) {
+// RegisterFederationCollections registers external collections for federation-synced services and workloads.
+// This allows federation-synced remote services to be included in the ambient index's Lookup results.
+// The parameters are typed as any to satisfy model.FederationAmbientIndex interface (avoiding import cycles).
+func (a *index) RegisterFederationCollections(services, workloads any) {
 	svcCol := services.(krt.StaticCollection[model.ServiceInfo])
 	wlCol := workloads.(krt.StaticCollection[model.WorkloadInfo])
 
-	a.gossip.services = svcCol
-	a.gossip.workloads = wlCol
-	a.gossip.registered = true
+	a.federation.services = svcCol
+	a.federation.workloads = wlCol
+	a.federation.registered = true
 
-	// Register event handlers to trigger XDS pushes when gossip data changes
+	// Register event handlers to trigger XDS pushes when federation data changes
 	if a.XDSUpdater != nil {
 		svcCol.RegisterBatch(krt.BatchedEventFilter(
 			func(s model.ServiceInfo) *workloadapi.Service {
@@ -273,5 +273,5 @@ func (a *index) RegisterGossipCollections(services, workloads any) {
 		), false)
 	}
 
-	log.Infof("Registered gossip collections with ambient index")
+	log.Infof("Registered federation collections with ambient index")
 }

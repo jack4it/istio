@@ -20,7 +20,7 @@ import (
 	"istio.io/istio/pilot/pkg/features"
 	"istio.io/istio/pilot/pkg/model"
 	"istio.io/istio/pilot/pkg/serviceregistry/aggregate"
-	"istio.io/istio/pilot/pkg/serviceregistry/gossip"
+	"istio.io/istio/pilot/pkg/serviceregistry/federation"
 	kubecontroller "istio.io/istio/pilot/pkg/serviceregistry/kube/controller"
 	"istio.io/istio/pilot/pkg/serviceregistry/provider"
 	"istio.io/istio/pilot/pkg/serviceregistry/serviceentry"
@@ -63,10 +63,10 @@ func (s *Server) initServiceControllers(args *PilotArgs) error {
 		}
 	}
 
-	// Initialize gossip federation if enabled.
+	// Initialize federation if enabled.
 	// Must be done before serviceControllers.Run so the sync protocol gets started.
-	if features.EnableGossipFederation {
-		if err := s.initGossipSync(args, serviceControllers); err != nil {
+	if features.EnableFederation {
+		if err := s.initFederationSync(args, serviceControllers); err != nil {
 			return err
 		}
 	}
@@ -105,22 +105,41 @@ func (s *Server) initKubeRegistry(args *PilotArgs) (err error) {
 	return err
 }
 
-// initGossipSync initializes gossip-based federation.
-// This enables peer-to-peer synchronization of ambient global services between istiod instances.
-func (s *Server) initGossipSync(args *PilotArgs, serviceControllers *aggregate.Controller) error {
-	log.Info("Initializing gossip federation")
+// initFederationSync initializes Service Bus–based federation.
+// This enables pub/sub synchronization of ambient global services via Azure Service Bus.
+func (s *Server) initFederationSync(args *PilotArgs, serviceControllers *aggregate.Controller) error {
+	log.Info("Initializing Service Bus federation")
 
 	stopCh := make(chan struct{})
 
 	// Get local network from feature flag
-	localNetwork := network.ID(features.GossipLocalNetwork)
+	localNetwork := network.ID(features.FederationLocalNetwork)
 
-	// Create sync protocol - gossip data flows directly to ambient index via KRT collections
-	// We pass a getter for the ambient index because it may not be available until the
-	// k8s registry is fully initialized (which happens asynchronously via multicluster).
-	syncProtocol, err := gossip.NewSyncProtocol(gossip.SyncProtocolConfig{
+	// Determine subscription name: explicit config or fall back to cluster ID
+	subscriptionName := features.ServiceBusSubscription
+	if subscriptionName == "" {
+		subscriptionName = string(s.clusterID)
+	}
+
+	// Create the Service Bus transport
+	sbTransport, err := federation.NewServiceBusTransport(federation.ServiceBusConfig{
+		ConnectionString:        features.ServiceBusConnectionString,
+		FullyQualifiedNamespace: features.ServiceBusNamespace,
+		TopicName:               features.ServiceBusTopic,
+		SubscriptionName:        subscriptionName,
+		LocalClusterID:          s.clusterID,
+		SnapshotInterval:        features.ServiceBusSnapshotInterval,
+		StopCh:                  stopCh,
+		MessageHandler:          nil, // Set by SyncProtocol before Start()
+	})
+	if err != nil {
+		return fmt.Errorf("failed to create Service Bus transport: %w", err)
+	}
+
+	// Create sync protocol with the Service Bus transport injected
+	syncProtocol, err := federation.NewSyncProtocol(federation.SyncProtocolConfig{
 		LocalClusterID: s.clusterID,
-		AmbientIndexGetter: func() model.GossipAmbientIndex {
+		AmbientIndexGetter: func() model.FederationAmbientIndex {
 			return serviceControllers.GetAmbientIndex()
 		},
 		LocalNetworkGatewayGetter: func() *model.NetworkGateway {
@@ -135,19 +154,16 @@ func (s *Server) initGossipSync(args *PilotArgs, serviceControllers *aggregate.C
 		TrustDomainGetter: func() string {
 			return s.environment.Mesh().GetTrustDomain()
 		},
-		XDSUpdater:    s.XDSServer,
-		NodeName:      gossip.NodeName(s.clusterID),
-		BindAddr:      "0.0.0.0",
-		BindPort:      features.GossipBindPort,
-		AdvertiseAddr: features.GossipAdvertiseAddr,
-		StopCh:        stopCh,
+		XDSUpdater: s.XDSServer,
+		Transport:  sbTransport,
+		StopCh:     stopCh,
 	})
 	if err != nil {
 		return fmt.Errorf("failed to create sync protocol: %w", err)
 	}
 
 	// Start the sync protocol
-	s.addStartFunc("gossip registry", func(stop <-chan struct{}) error {
+	s.addStartFunc("federation registry", func(stop <-chan struct{}) error {
 		go func() {
 			<-stop
 			close(stopCh)
@@ -158,6 +174,6 @@ func (s *Server) initGossipSync(args *PilotArgs, serviceControllers *aggregate.C
 		return syncProtocol.Start()
 	})
 
-	log.Info("Gossip federation initialized")
+	log.Info("Service Bus federation initialized")
 	return nil
 }
