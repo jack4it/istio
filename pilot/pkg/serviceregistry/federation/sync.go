@@ -423,8 +423,13 @@ func (sp *SyncProtocol) buildFullSyncMessage() *SyncMessage {
 }
 
 // handleServiceUpsert enqueues a service add or update for debounced broadcasting.
+// Only the leader publishes outbound messages, so non-leader replicas drop events
+// to avoid blocking on the bounded outgoingCh.
 func (sp *SyncProtocol) handleServiceUpsert(svc *model.ServiceInfo) {
 	if svc == nil || svc.Scope != model.Global {
+		return
+	}
+	if !sp.isLeader.Load() {
 		return
 	}
 
@@ -437,7 +442,13 @@ func (sp *SyncProtocol) handleServiceUpsert(svc *model.ServiceInfo) {
 }
 
 // handleServiceDelete enqueues a service deletion for debounced broadcasting.
+// Only the leader publishes outbound messages, so non-leader replicas drop events
+// to avoid blocking on the bounded outgoingCh.
 func (sp *SyncProtocol) handleServiceDelete(hostname string) {
+	if !sp.isLeader.Load() {
+		return
+	}
+
 	syncLog.Debugf("Enqueuing service delete: %s", hostname)
 
 	select {
