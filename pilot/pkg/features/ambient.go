@@ -100,6 +100,12 @@ var (
 
 	ServiceBusSnapshotInterval = env.Register("PILOT_SERVICEBUS_SNAPSHOT_INTERVAL", 5*time.Minute,
 		"How often to publish a full-sync snapshot to Service Bus for cold-start bootstrap of new istiod instances.").Get()
+
+	ServiceBusAutoCreateSubscription = env.Register("PILOT_SERVICEBUS_AUTO_CREATE_SUBSCRIPTION", false,
+		"If true, each istiod replica auto-creates its own Service Bus subscription (<clusterID>-<podName>) "+
+			"with autoDeleteOnIdle=30m for HA multi-replica deployments. Requires 'Manage' claim or "+
+			"'Azure Service Bus Data Owner' role. When false, all replicas share a single pre-provisioned "+
+			"subscription — only correct for single-replica deployments.").Get()
 )
 
 // registerAmbient registers a variable that is allowed only if EnableAmbient is set

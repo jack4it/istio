@@ -22,6 +22,7 @@ import (
 
 	"github.com/Azure/azure-sdk-for-go/sdk/azidentity"
 	"github.com/Azure/azure-sdk-for-go/sdk/messaging/azservicebus"
+	"github.com/Azure/azure-sdk-for-go/sdk/messaging/azservicebus/admin"
 
 	"istio.io/istio/pilot/pkg/model"
 	"istio.io/istio/pkg/cluster"
@@ -46,9 +47,22 @@ type ServiceBusTransport struct {
 	sender   *azservicebus.Sender
 	receiver *azservicebus.Receiver
 
+	// adminClient is used for subscription auto-creation/deletion in HA mode.
+	// Nil when AutoCreateSubscription is false.
+	adminClient *admin.Client
+
 	localClusterID cluster.ID
 	topicName      string
 	subscriptionID string
+
+	// bootstrapSubscriptionID is the cluster-level subscription used for
+	// peek-based bootstrap. Pre-provisioned, never actively consumed.
+	// Empty when AutoCreateSubscription is false (single-replica mode).
+	bootstrapSubscriptionID string
+
+	// autoCreatedSubscription is true if this transport created its own subscription.
+	// Used to determine whether to delete it during shutdown.
+	autoCreatedSubscription bool
 
 	messageHandler func(msg *SyncMessage)
 	stopCh         chan struct{}
@@ -97,6 +111,20 @@ type ServiceBusConfig struct {
 	// Defaults to 100 if zero.
 	BootstrapBatchSize int
 
+	// AutoCreateSubscription enables per-replica subscription auto-creation.
+	// When true, the transport creates a subscription named <clusterID>-<podName>
+	// with autoDeleteOnIdle=30m and a SQL filter (ClusterID <> '<clusterID>').
+	// This is required for HA deployments with multiple istiod replicas per cluster.
+	// Requires 'Manage' claim or 'Azure Service Bus Data Owner' role.
+	AutoCreateSubscription bool
+
+	// BootstrapSubscriptionName is the cluster-level subscription used for
+	// peek-based bootstrap when AutoCreateSubscription is true.
+	// Pre-provisioned, never actively consumed — messages accumulate and expire
+	// via TTL. All replicas peek from this subscription to get initial state
+	// from retained full-sync snapshots. Defaults to cluster ID if empty.
+	BootstrapSubscriptionName string
+
 	// StopCh signals shutdown.
 	StopCh chan struct{}
 }
@@ -121,10 +149,20 @@ func NewServiceBusTransport(cfg ServiceBusConfig) (*ServiceBusTransport, error) 
 	}
 
 	var client *azservicebus.Client
+	var adminCl *admin.Client
 	var err error
 
 	if cfg.ConnectionString != "" {
 		client, err = azservicebus.NewClientFromConnectionString(cfg.ConnectionString, nil)
+		if err != nil {
+			return nil, fmt.Errorf("failed to create Service Bus client: %w", err)
+		}
+		if cfg.AutoCreateSubscription {
+			adminCl, err = admin.NewClientFromConnectionString(cfg.ConnectionString, nil)
+			if err != nil {
+				return nil, fmt.Errorf("failed to create Service Bus admin client: %w", err)
+			}
+		}
 	} else if cfg.FullyQualifiedNamespace != "" {
 		// Use Azure Workload Identity (DefaultAzureCredential).
 		// In AKS with Workload Identity enabled, the pod's service account token
@@ -134,24 +172,23 @@ func NewServiceBusTransport(cfg ServiceBusConfig) (*ServiceBusTransport, error) 
 			return nil, fmt.Errorf("failed to create Azure credential: %w", credErr)
 		}
 		client, err = azservicebus.NewClient(cfg.FullyQualifiedNamespace, cred, nil)
+		if err != nil {
+			return nil, fmt.Errorf("failed to create Service Bus client: %w", err)
+		}
+		if cfg.AutoCreateSubscription {
+			adminCl, err = admin.NewClient(cfg.FullyQualifiedNamespace, cred, nil)
+			if err != nil {
+				return nil, fmt.Errorf("failed to create Service Bus admin client: %w", err)
+			}
+		}
 	} else {
 		return nil, fmt.Errorf("either ConnectionString or FullyQualifiedNamespace is required")
-	}
-
-	if err != nil {
-		return nil, fmt.Errorf("failed to create Service Bus client: %w", err)
 	}
 
 	// Create sender for the topic
 	sender, err := client.NewSender(cfg.TopicName, nil)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create sender for topic %s: %w", cfg.TopicName, err)
-	}
-
-	// Create receiver for this cluster's subscription
-	receiver, err := client.NewReceiverForSubscription(cfg.TopicName, cfg.SubscriptionName, nil)
-	if err != nil {
-		return nil, fmt.Errorf("failed to create receiver for subscription %s: %w", cfg.SubscriptionName, err)
 	}
 
 	drainTimeout := cfg.BootstrapDrainTimeout
@@ -164,10 +201,10 @@ func NewServiceBusTransport(cfg ServiceBusConfig) (*ServiceBusTransport, error) 
 		batchSize = 100
 	}
 
-	return &ServiceBusTransport{
+	t := &ServiceBusTransport{
 		client:                client,
 		sender:                sender,
-		receiver:              receiver,
+		adminClient:           adminCl,
 		localClusterID:        cfg.LocalClusterID,
 		topicName:             cfg.TopicName,
 		subscriptionID:        cfg.SubscriptionName,
@@ -176,7 +213,31 @@ func NewServiceBusTransport(cfg ServiceBusConfig) (*ServiceBusTransport, error) 
 		bootstrapDrainTimeout: drainTimeout,
 		bootstrapBatchSize:    batchSize,
 		stopCh:                cfg.StopCh,
-	}, nil
+	}
+
+	// Auto-create per-replica subscription if enabled
+	if cfg.AutoCreateSubscription {
+		if err := t.ensureSubscription(); err != nil {
+			return nil, fmt.Errorf("failed to ensure subscription %s: %w", cfg.SubscriptionName, err)
+		}
+		t.autoCreatedSubscription = true
+
+		// Store the cluster-level bootstrap subscription name for peek-based bootstrap.
+		// This subscription is pre-provisioned and accumulates snapshots via TTL.
+		t.bootstrapSubscriptionID = cfg.BootstrapSubscriptionName
+		if t.bootstrapSubscriptionID == "" {
+			t.bootstrapSubscriptionID = string(cfg.LocalClusterID)
+		}
+	}
+
+	// Create receiver for this cluster's subscription
+	receiver, err := client.NewReceiverForSubscription(cfg.TopicName, cfg.SubscriptionName, nil)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create receiver for subscription %s: %w", cfg.SubscriptionName, err)
+	}
+	t.receiver = receiver
+
+	return t, nil
 }
 
 // Start initializes the Service Bus transport with a two-phase bootstrap:
@@ -211,9 +272,22 @@ func (t *ServiceBusTransport) BootstrapDone() <-chan struct{} {
 
 // bootstrapThenReceive runs the two-phase startup sequence.
 func (t *ServiceBusTransport) bootstrapThenReceive() {
-	sbLog.Info("Phase 1: draining retained messages for bootstrap")
-	retained := t.drainRetainedMessages()
-	sbLog.Infof("Phase 1 complete: drained %d retained messages", len(retained))
+	var retained []*SyncMessage
+
+	if t.bootstrapSubscriptionID != "" {
+		// HA mode: peek from the pre-provisioned cluster-level subscription.
+		// This subscription is never actively consumed — messages accumulate
+		// and expire via TTL. Peek is non-destructive, so all replicas can
+		// peek simultaneously without interference.
+		sbLog.Infof("Phase 1: peeking retained messages from bootstrap subscription %s", t.bootstrapSubscriptionID)
+		retained = t.peekBootstrapMessages()
+	} else {
+		// Single-replica mode: drain from the active subscription (original behavior).
+		sbLog.Info("Phase 1: draining retained messages for bootstrap")
+		retained = t.drainRetainedMessages()
+	}
+
+	sbLog.Infof("Phase 1 complete: %d retained messages", len(retained))
 
 	// Merge retained messages: keep only the latest full-sync per cluster,
 	// discard superseded snapshots and stale incrementals.
@@ -229,6 +303,80 @@ func (t *ServiceBusTransport) bootstrapThenReceive() {
 	close(t.bootstrapDone)
 	sbLog.Info("Bootstrap complete, switching to live receive loop")
 	t.receiveLoop()
+}
+
+// peekBootstrapMessages reads all retained messages from the cluster-level
+// bootstrap subscription using non-destructive peek. This is used in HA mode
+// where per-replica subscriptions are freshly created and have no retained
+// messages. The cluster subscription accumulates snapshots that any replica
+// can peek to bootstrap its federation state.
+func (t *ServiceBusTransport) peekBootstrapMessages() []*SyncMessage {
+	// Create a temporary receiver for the bootstrap subscription (peek only)
+	bootstrapReceiver, err := t.client.NewReceiverForSubscription(t.topicName, t.bootstrapSubscriptionID, nil)
+	if err != nil {
+		sbLog.Warnf("Failed to create bootstrap receiver for subscription %s, starting with empty state: %v",
+			t.bootstrapSubscriptionID, err)
+		return nil
+	}
+	defer func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		bootstrapReceiver.Close(ctx)
+	}()
+
+	var allMessages []*SyncMessage
+	fromSeqNum := int64(0)
+
+	for {
+		select {
+		case <-t.stopCh:
+			return allMessages
+		default:
+		}
+
+		ctx, cancel := context.WithTimeout(context.Background(), t.bootstrapDrainTimeout)
+		messages, err := bootstrapReceiver.PeekMessages(ctx, t.bootstrapBatchSize, &azservicebus.PeekMessagesOptions{
+			FromSequenceNumber: &fromSeqNum,
+		})
+		cancel()
+
+		if err != nil {
+			if ctx.Err() == nil {
+				sbLog.Warnf("Error during bootstrap peek, proceeding with %d messages: %v", len(allMessages), err)
+			}
+			break
+		}
+
+		if len(messages) == 0 {
+			break
+		}
+
+		for _, m := range messages {
+			var syncMsg SyncMessage
+			if err := json.Unmarshal(m.Body, &syncMsg); err != nil {
+				sbLog.Warnf("Bootstrap peek: failed to unmarshal message, skipping: %v", err)
+				continue
+			}
+
+			// Convert wire format to ServiceInfo
+			syncMsg.Services = make([]model.ServiceInfo, 0, len(syncMsg.WireServices))
+			for i := range syncMsg.WireServices {
+				if svc := syncMsg.WireServices[i].ToServiceInfo(); svc != nil {
+					syncMsg.Services = append(syncMsg.Services, *svc)
+				}
+			}
+
+			allMessages = append(allMessages, &syncMsg)
+
+			// Advance sequence number for next peek batch
+			if m.SequenceNumber != nil && *m.SequenceNumber >= fromSeqNum {
+				fromSeqNum = *m.SequenceNumber + 1
+			}
+		}
+	}
+
+	sbLog.Infof("Peeked %d messages from bootstrap subscription %s", len(allMessages), t.bootstrapSubscriptionID)
+	return allMessages
 }
 
 // drainRetainedMessages reads all currently available messages from the
@@ -374,12 +522,95 @@ func (t *ServiceBusTransport) Shutdown() error {
 	if err := t.sender.Close(ctx); err != nil && firstErr == nil {
 		firstErr = fmt.Errorf("close sender: %w", err)
 	}
+
+	// Delete auto-created subscription on graceful shutdown.
+	// If the pod is OOM-killed or the node crashes, autoDeleteOnIdle handles cleanup.
+	if t.autoCreatedSubscription {
+		if err := t.deleteSubscription(); err != nil {
+			sbLog.Warnf("Failed to delete subscription %s (will auto-delete after idle): %v", t.subscriptionID, err)
+		}
+	}
+
 	if err := t.client.Close(ctx); err != nil && firstErr == nil {
 		firstErr = fmt.Errorf("close client: %w", err)
 	}
 
 	sbLog.Info("Service Bus transport shut down")
 	return firstErr
+}
+
+// ensureSubscription creates a per-replica subscription with a SQL filter and
+// autoDeleteOnIdle if it does not already exist. This is the HA mechanism:
+// each istiod replica gets its own subscription so it receives ALL messages.
+func (t *ServiceBusTransport) ensureSubscription() error {
+	if t.adminClient == nil {
+		return fmt.Errorf("admin client required for subscription auto-creation")
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	// Check if subscription already exists (pod restart with same name)
+	_, err := t.adminClient.GetSubscription(ctx, t.topicName, t.subscriptionID, nil)
+	if err == nil {
+		sbLog.Infof("Subscription %s already exists, reusing", t.subscriptionID)
+		return nil
+	}
+
+	// Create the subscription with autoDeleteOnIdle for orphan cleanup
+	autoDeleteOnIdle := "PT30M" // 30 minutes
+	defaultTTL := "PT10M"       // 10 minutes (matches design doc)
+	maxDelivery := int32(10)
+	lockDuration := "PT1M"
+
+	_, err = t.adminClient.CreateSubscription(ctx, t.topicName, t.subscriptionID, &admin.CreateSubscriptionOptions{
+		Properties: &admin.SubscriptionProperties{
+			AutoDeleteOnIdle:         &autoDeleteOnIdle,
+			DefaultMessageTimeToLive: &defaultTTL,
+			MaxDeliveryCount:         &maxDelivery,
+			LockDuration:             &lockDuration,
+		},
+	})
+	if err != nil {
+		return fmt.Errorf("create subscription %s: %w", t.subscriptionID, err)
+	}
+
+	sbLog.Infof("Created subscription %s with autoDeleteOnIdle=%s", t.subscriptionID, autoDeleteOnIdle)
+
+	// Delete the default $Default rule (matches all messages)
+	_, _ = t.adminClient.DeleteRule(ctx, t.topicName, t.subscriptionID, "$Default", nil)
+
+	// Create SQL filter to exclude messages from this cluster
+	filterExpr := fmt.Sprintf("ClusterID <> '%s'", string(t.localClusterID))
+	ruleName := "filterSelfCluster"
+	_, err = t.adminClient.CreateRule(ctx, t.topicName, t.subscriptionID, &admin.CreateRuleOptions{
+		Name:   &ruleName,
+		Filter: &admin.SQLFilter{Expression: filterExpr},
+	})
+	if err != nil {
+		return fmt.Errorf("create filter rule on subscription %s: %w", t.subscriptionID, err)
+	}
+
+	sbLog.Infof("Created SQL filter on subscription %s: %s", t.subscriptionID, filterExpr)
+	return nil
+}
+
+// deleteSubscription removes this replica's subscription during graceful shutdown.
+func (t *ServiceBusTransport) deleteSubscription() error {
+	if t.adminClient == nil {
+		return nil
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	_, err := t.adminClient.DeleteSubscription(ctx, t.topicName, t.subscriptionID, nil)
+	if err != nil {
+		return err
+	}
+
+	sbLog.Infof("Deleted auto-created subscription %s", t.subscriptionID)
+	return nil
 }
 
 // sendMessage serializes a SyncMessage and publishes it to the topic.

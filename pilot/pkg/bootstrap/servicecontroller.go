@@ -18,6 +18,7 @@ import (
 	"fmt"
 
 	"istio.io/istio/pilot/pkg/features"
+	"istio.io/istio/pilot/pkg/leaderelection"
 	"istio.io/istio/pilot/pkg/model"
 	"istio.io/istio/pilot/pkg/serviceregistry/aggregate"
 	"istio.io/istio/pilot/pkg/serviceregistry/federation"
@@ -107,6 +108,15 @@ func (s *Server) initKubeRegistry(args *PilotArgs) (err error) {
 
 // initFederationSync initializes Service Bus–based federation.
 // This enables pub/sub synchronization of ambient global services via Azure Service Bus.
+//
+// Multi-replica HA behavior:
+//   - When AutoCreateSubscription is true, each replica creates its own Service Bus
+//     subscription (<clusterID>-<podName>) with autoDeleteOnIdle=30m, ensuring all
+//     replicas receive ALL inbound messages and maintain complete federation state.
+//   - Leader election gates outbound publishing: only the leader publishes snapshots
+//     and service change events to Service Bus. All replicas process inbound messages.
+//   - Version vectors use max(counter+1, time.Now().UnixMilli()) to ensure a new
+//     leader always produces versions higher than the previous leader.
 func (s *Server) initFederationSync(args *PilotArgs, serviceControllers *aggregate.Controller) error {
 	log.Info("Initializing Service Bus federation")
 
@@ -115,9 +125,19 @@ func (s *Server) initFederationSync(args *PilotArgs, serviceControllers *aggrega
 	// Get local network from feature flag
 	localNetwork := network.ID(features.FederationLocalNetwork)
 
-	// Determine subscription name: explicit config or fall back to cluster ID
+	// Determine subscription name.
+	// With AutoCreateSubscription: <clusterID>-<podName> (unique per replica)
+	// Without: explicit config or cluster ID (shared by all replicas — single-replica only)
 	subscriptionName := features.ServiceBusSubscription
-	if subscriptionName == "" {
+	if features.ServiceBusAutoCreateSubscription {
+		// Per-replica subscription for HA deployments
+		podName := args.PodName
+		if podName == "" {
+			podName = "default"
+		}
+		subscriptionName = string(s.clusterID) + "-" + podName
+		log.Infof("Using per-replica subscription: %s", subscriptionName)
+	} else if subscriptionName == "" {
 		subscriptionName = string(s.clusterID)
 	}
 
@@ -128,6 +148,7 @@ func (s *Server) initFederationSync(args *PilotArgs, serviceControllers *aggrega
 		TopicName:               features.ServiceBusTopic,
 		SubscriptionName:        subscriptionName,
 		LocalClusterID:          s.clusterID,
+		AutoCreateSubscription:  features.ServiceBusAutoCreateSubscription,
 		StopCh:                  stopCh,
 		MessageHandler:          nil, // Set by SyncProtocol before Start()
 	})
@@ -162,7 +183,7 @@ func (s *Server) initFederationSync(args *PilotArgs, serviceControllers *aggrega
 		return fmt.Errorf("failed to create sync protocol: %w", err)
 	}
 
-	// Start the sync protocol
+	// Start the sync protocol (transport + inbound processing on all replicas)
 	s.addStartFunc("federation registry", func(stop <-chan struct{}) error {
 		go func() {
 			<-stop
@@ -173,6 +194,18 @@ func (s *Server) initFederationSync(args *PilotArgs, serviceControllers *aggrega
 		}()
 		return syncProtocol.Start()
 	})
+
+	// Use leader election to gate outbound publishing.
+	// Only the leader replica publishes snapshots and service change events.
+	// All replicas process inbound messages independently.
+	go leaderelection.
+		NewLeaseLeaderElection(args.Namespace, args.PodName, leaderelection.FederationController, args.Revision, s.kubeClient).
+		AddRunFunction(func(leaderStop <-chan struct{}) {
+			syncProtocol.BecomeLeader(leaderStop)
+			<-leaderStop
+			// StopLeading is called by BecomeLeader's goroutine
+		}).
+		Run(stopCh)
 
 	log.Info("Service Bus federation initialized")
 	return nil

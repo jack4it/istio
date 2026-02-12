@@ -16,6 +16,7 @@ package federation
 
 import (
 	"fmt"
+	"sync/atomic"
 	"time"
 
 	"istio.io/istio/pilot/pkg/model"
@@ -87,6 +88,16 @@ type SyncProtocol struct {
 	// outgoingCh buffers local service change events for debounced broadcasting.
 	// Events are deduplicated per hostname and batched into a single SyncMessage.
 	outgoingCh chan outgoingEvent
+
+	// isLeader is true when this replica holds the federation leader lease.
+	// Only the leader publishes outbound messages (snapshots + service events).
+	// All replicas process inbound messages to maintain complete federation state.
+	isLeader atomic.Bool
+
+	// leaderStopCh is closed when this replica loses leader status.
+	// It signals the snapshot loop and outgoing debounce loop to stop.
+	// Re-created each time leadership is acquired.
+	leaderStopCh chan struct{}
 
 	// stopCh signals shutdown.
 	stopCh chan struct{}
@@ -208,25 +219,29 @@ func NewSyncProtocol(cfg SyncProtocolConfig) (*SyncProtocol, error) {
 	return sp, nil
 }
 
-// Start begins federation messaging, registers for service change events,
-// and registers federation collections with the ambient index.
-// The order is important to avoid races:
-// 1. Start transport (so we can send/receive messages)
-// 2. Register federation collections with ambient index
-// 3. Register for service change events (so we can broadcast changes)
-// 4. Send initial full sync (after collections have populated)
+// Start begins federation messaging and registers for service change events.
+//
+// All replicas:
+//   - Start transport (receive inbound messages from remote clusters)
+//   - Process incoming messages → store → KRT → XDS push
+//   - Register federation collections with ambient index
+//   - Register for global service change events (enqueue to outgoingCh)
+//
+// Leader only (activated via BecomeLeader):
+//   - Outgoing debounce loop (drain outgoingCh → broadcast to Service Bus)
+//   - Snapshot loop (periodic full-sync publish)
+//
+// This separation ensures all replicas have identical federation state for
+// serving ztunnel/envoy, while only one replica publishes to Service Bus.
 func (sp *SyncProtocol) Start() error {
-	// 1. Start transport first — must be running before we can broadcast
+	// 1. Start transport first — must be running before we can receive
 	if err := sp.transport.Start(); err != nil {
 		return fmt.Errorf("failed to start transport: %w", err)
 	}
 	syncLog.Info("Transport started")
 
-	// Start debounced message processors for both directions.
-	// Inbound: messages → store → (debounce) → KRT + XDS push
-	// Outbound: ambient events → (debounce) → batched SyncMessage → transport
+	// 2. Start inbound message processor (all replicas)
 	go sp.processIncomingDebounced()
-	go sp.processOutgoingDebounced()
 
 	// Get ambient index — may be nil if not yet available or not enabled
 	if sp.ambientIndexGetter != nil {
@@ -234,11 +249,13 @@ func (sp *SyncProtocol) Start() error {
 	}
 
 	if sp.ambientIndex != nil {
-		// 2. Register federation collections with ambient index
+		// 3. Register federation collections with ambient index
 		sp.ambientIndex.RegisterFederationCollections(sp.federationServices, sp.federationWorkloads)
 		syncLog.Info("Registered federation collections with ambient index")
 
-		// 3. Register for push-based global service change events
+		// 4. Register for push-based global service change events.
+		// Events are enqueued to outgoingCh on all replicas but only
+		// broadcast by processOutgoingDebounced when isLeader is true.
 		sp.ambientIndex.RegisterGlobalServiceHandler(func(prev, curr *model.ServiceInfo, event model.Event) {
 			switch event {
 			case model.EventAdd, model.EventUpdate:
@@ -250,38 +267,77 @@ func (sp *SyncProtocol) Start() error {
 			}
 		})
 		syncLog.Info("Registered for push-based global service events")
-
-		// 4. Start the snapshot loop, which waits for bootstrap to complete,
-		// sends an initial full sync, then publishes periodic snapshots.
-		if sp.snapshotInterval > 0 {
-			go sp.snapshotLoop()
-		}
 	} else {
 		syncLog.Warn("No ambient index available — federation sync will only exchange peer metadata")
 	}
 
-	syncLog.Info("Sync protocol started")
+	syncLog.Info("Sync protocol started (awaiting leader election for outbound publishing)")
 	return nil
 }
 
 // Stop gracefully stops the sync protocol.
 func (sp *SyncProtocol) Stop() error {
+	sp.StopLeading() // stop outbound if leading
 	return sp.transport.Shutdown()
+}
+
+// BecomeLeader activates outbound publishing on this replica.
+// Called by the leader election callback when this istiod wins the lease.
+// It starts the outgoing debounce loop and the snapshot loop, and publishes
+// an immediate full-sync snapshot so remote clusters see the new leader's state.
+func (sp *SyncProtocol) BecomeLeader(leaderStop <-chan struct{}) {
+	if sp.isLeader.Load() {
+		return
+	}
+
+	sp.leaderStopCh = make(chan struct{})
+	sp.isLeader.Store(true)
+	syncLog.Info("This replica is now the federation leader — starting outbound publishing")
+
+	// Start the outgoing debounce loop (drains outgoingCh → broadcast)
+	go sp.processOutgoingDebounced()
+
+	// Start the snapshot loop (periodic full sync publish)
+	if sp.snapshotInterval > 0 {
+		go sp.snapshotLoop()
+	}
+
+	// Bridge the external leaderStop to our internal leaderStopCh
+	go func() {
+		select {
+		case <-leaderStop:
+			sp.StopLeading()
+		case <-sp.stopCh:
+		}
+	}()
+}
+
+// StopLeading deactivates outbound publishing on this replica.
+// Called when this replica loses the leader lease.
+func (sp *SyncProtocol) StopLeading() {
+	if !sp.isLeader.CompareAndSwap(true, false) {
+		return
+	}
+	syncLog.Info("This replica lost federation leadership — stopping outbound publishing")
+	close(sp.leaderStopCh)
 }
 
 // snapshotLoop waits for bootstrap to complete, then publishes an initial
 // full-sync snapshot and repeats at snapshotInterval. This provides the
 // retained messages that new istiods drain during their own bootstrap.
+// Only runs on the leader replica.
 func (sp *SyncProtocol) snapshotLoop() {
 	// Wait for bootstrap to complete before publishing snapshots.
 	select {
 	case <-sp.transport.BootstrapDone():
+	case <-sp.leaderStopCh:
+		return
 	case <-sp.stopCh:
 		return
 	}
 
 	// Publish initial snapshot immediately after bootstrap.
-	syncLog.Info("Bootstrap complete, publishing initial full sync")
+	syncLog.Info("Leader bootstrap complete, publishing initial full sync")
 	sp.publishSnapshot()
 
 	ticker := time.NewTicker(sp.snapshotInterval)
@@ -291,8 +347,11 @@ func (sp *SyncProtocol) snapshotLoop() {
 		select {
 		case <-ticker.C:
 			sp.publishSnapshot()
+		case <-sp.leaderStopCh:
+			syncLog.Info("Snapshot loop stopping (lost leadership)")
+			return
 		case <-sp.stopCh:
-			syncLog.Info("Snapshot loop stopping")
+			syncLog.Info("Snapshot loop stopping (shutdown)")
 			return
 		}
 	}
@@ -390,11 +449,14 @@ func (sp *SyncProtocol) handleServiceDelete(hostname string) {
 // processOutgoingDebounced batches local service change events and broadcasts
 // them as a single SyncMessage. Events are deduplicated per hostname (last
 // event wins), so rapid-fire updates from deployments produce one message.
+// Only runs on the leader replica; exits when leadership is lost.
 func (sp *SyncProtocol) processOutgoingDebounced() {
 	for {
 		var ev outgoingEvent
 		select {
 		case ev = <-sp.outgoingCh:
+		case <-sp.leaderStopCh:
+			return
 		case <-sp.stopCh:
 			return
 		}
@@ -438,6 +500,10 @@ func (sp *SyncProtocol) processOutgoingDebounced() {
 				break drain
 			case <-maxTimer.C:
 				break drain
+			case <-sp.leaderStopCh:
+				quietTimer.Stop()
+				maxTimer.Stop()
+				return
 			case <-sp.stopCh:
 				quietTimer.Stop()
 				maxTimer.Stop()

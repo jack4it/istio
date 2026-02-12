@@ -16,6 +16,7 @@ package federation
 
 import (
 	"sync"
+	"time"
 
 	"istio.io/istio/pkg/cluster"
 )
@@ -35,11 +36,21 @@ func newVersionVector() *versionVector {
 }
 
 // Increment increases the version for the given cluster and returns the new version.
+// Uses max(current+1, currentTimeMillis) to ensure versions are always higher
+// after leader transitions across Istiod replicas. Within a single leader's
+// lifetime, +1 handles rapid-fire calls in the same millisecond. Across leaders,
+// the time component guarantees the new leader's versions exceed the old leader's
+// counter — since UnixMilli in 2026 (~1.77×10¹²) dwarfs any counter value.
 func (v *versionVector) increment(clusterID cluster.ID) uint64 {
 	v.mu.Lock()
 	defer v.mu.Unlock()
-	v.versions[clusterID]++
-	return v.versions[clusterID]
+	next := v.versions[clusterID] + 1
+	now := uint64(time.Now().UnixMilli())
+	if now > next {
+		next = now
+	}
+	v.versions[clusterID] = next
+	return next
 }
 
 // Get returns the current version for the given cluster.

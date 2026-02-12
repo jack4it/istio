@@ -59,6 +59,10 @@ const (
 	InferencePoolController     = "istio-gateway-inferencepool"
 	NodeUntaintController       = "istio-node-untaint"
 	IPAutoallocateController    = "istio-ip-autoallocate"
+	// FederationController controls outbound publishing of federation sync messages
+	// via Azure Service Bus. Only the leader replica publishes snapshots and service
+	// change events; all replicas process inbound messages independently.
+	FederationController = "istio-federation-leader"
 )
 
 // Leader election key prefix for remote istiod managed clusters
