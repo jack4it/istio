@@ -25,6 +25,18 @@ import (
 	"istio.io/istio/pkg/network"
 )
 
+const (
+	// debounceAfter is the quiet period after receiving a message before
+	// flushing accumulated state to KRT collections and triggering an XDS push.
+	// If more messages arrive within this window, the timer resets.
+	debounceAfter = 200 * time.Millisecond
+
+	// debounceMax is the maximum time to wait before flushing, regardless of
+	// whether messages are still arriving. This bounds worst-case latency
+	// during sustained high-throughput updates.
+	debounceMax = 2 * time.Second
+)
+
 var syncLog = log.RegisterScope("federation-sync", "Federation sync protocol")
 
 // SyncProtocol handles the synchronization protocol between istiod peers.
@@ -63,6 +75,11 @@ type SyncProtocol struct {
 
 	// xdsUpdater triggers XDS pushes when federation collections change.
 	xdsUpdater model.XDSUpdater
+
+	// incomingCh buffers incoming messages for debounced processing.
+	// Messages are applied to the store immediately but KRT collection
+	// resets and XDS pushes are batched.
+	incomingCh chan *SyncMessage
 
 	// stopCh signals shutdown.
 	stopCh chan struct{}
@@ -151,6 +168,7 @@ func NewSyncProtocol(cfg SyncProtocolConfig) (*SyncProtocol, error) {
 		federationWorkloads:       federationWorkloads,
 		localNetworkGatewayGetter: cfg.LocalNetworkGatewayGetter,
 		xdsUpdater:                cfg.XDSUpdater,
+		incomingCh:                make(chan *SyncMessage, 100),
 		stopCh:                    cfg.StopCh,
 		transport:                 cfg.Transport,
 	}
@@ -181,6 +199,10 @@ func (sp *SyncProtocol) Start() error {
 	}
 	syncLog.Info("Transport started")
 
+	// Start the debounced message processor. All incoming messages flow
+	// through incomingCh and are batched before updating KRT collections.
+	go sp.processIncomingDebounced()
+
 	// Get ambient index — may be nil if not yet available or not enabled
 	if sp.ambientIndexGetter != nil {
 		sp.ambientIndex = sp.ambientIndexGetter()
@@ -206,12 +228,18 @@ func (sp *SyncProtocol) Start() error {
 		})
 		syncLog.Info("Registered for push-based global service events")
 
-		// 4. Send initial full sync after a short delay for KRT to populate.
+		// 4. Wait for bootstrap to complete, then send initial full sync.
+		// The transport's two-phase bootstrap drains retained messages first,
+		// so we don't broadcast until we've loaded remote state.
 		go func() {
-			time.Sleep(10 * time.Second)
-			syncLog.Info("Sending initial full sync")
-			msg := sp.buildFullSyncMessage()
-			sp.broadcast(msg)
+			select {
+			case <-sp.transport.BootstrapDone():
+				syncLog.Info("Bootstrap complete, sending initial full sync")
+				msg := sp.buildFullSyncMessage()
+				sp.broadcast(msg)
+			case <-sp.stopCh:
+				return
+			}
 		}()
 	} else {
 		syncLog.Warn("No ambient index available — federation sync will only exchange peer metadata")
@@ -366,27 +394,85 @@ func (sp *SyncProtocol) handleServiceDelete(hostname string) {
 	syncLog.Debugf("Broadcasted service delete tombstone at version %d", version)
 }
 
-// handleIncomingMessage processes a message received from a peer.
+// processIncomingDebounced is the main loop for debounced message processing.
+// It accumulates incoming messages and applies them to the store immediately
+// (so version vectors stay current), but defers the expensive KRT collection
+// reset and XDS push until a quiet period or max wait is reached.
+//
+// This provides two layers of batching:
+//  1. Federation debounce (200ms quiet / 2s max) — batches store→KRT→push
+//  2. Istiod's built-in XDS debounce (100ms/10s) — batches pushes to proxies
+func (sp *SyncProtocol) processIncomingDebounced() {
+	for {
+		// Block until first message arrives.
+		var msg *SyncMessage
+		select {
+		case msg = <-sp.incomingCh:
+		case <-sp.stopCh:
+			return
+		}
+
+		sp.store.handleSyncMessage(msg)
+		count := 1
+
+		// Start debounce timers.
+		quietTimer := time.NewTimer(debounceAfter)
+		maxTimer := time.NewTimer(debounceMax)
+
+		// Accumulate more messages within the debounce window.
+	drain:
+		for {
+			select {
+			case msg = <-sp.incomingCh:
+				sp.store.handleSyncMessage(msg)
+				count++
+				if !quietTimer.Stop() {
+					<-quietTimer.C
+				}
+				quietTimer.Reset(debounceAfter)
+			case <-quietTimer.C:
+				break drain
+			case <-maxTimer.C:
+				break drain
+			case <-sp.stopCh:
+				quietTimer.Stop()
+				maxTimer.Stop()
+				return
+			}
+		}
+		quietTimer.Stop()
+		maxTimer.Stop()
+
+		// Single batch update: rebuild KRT collections and trigger one XDS push.
+		services, workloads := sp.store.getFederationState()
+		sp.federationServices.Reset(services)
+		sp.federationWorkloads.Reset(workloads)
+
+		if sp.xdsUpdater != nil {
+			sp.xdsUpdater.ConfigUpdate(&model.PushRequest{
+				Full:   true,
+				Reason: model.NewReasonStats(model.FederationUpdate),
+			})
+		}
+
+		syncLog.Infof("Flushed debounced federation update: %d messages, %d services, %d workloads",
+			count, len(services), len(workloads))
+	}
+}
+
+// handleIncomingMessage enqueues a received message for debounced processing.
+// The message is applied to the store in processIncomingDebounced, and KRT
+// collections are only rebuilt once per debounce window.
 func (sp *SyncProtocol) handleIncomingMessage(msg *SyncMessage) {
 	if msg == nil {
 		return
 	}
 
-	// Delegate to store for processing
-	sp.store.handleSyncMessage(msg)
+	syncLog.Debugf("Received sync from cluster %s: %d services, fullSync=%v — enqueuing",
+		msg.ClusterID, len(msg.Services), msg.FullSync)
 
-	// Update KRT collections with the new state from the store
-	services, workloads := sp.store.getFederationState()
-	sp.federationServices.Reset(services)
-	sp.federationWorkloads.Reset(workloads)
-	syncLog.Infof("Updated federation collections: %d services, %d workloads", len(services), len(workloads))
-
-	// Trigger XDS push to notify ztunnel about new services/workloads
-	if sp.xdsUpdater != nil && (len(services) > 0 || len(workloads) > 0) {
-		sp.xdsUpdater.ConfigUpdate(&model.PushRequest{
-			Full:   true,
-			Reason: model.NewReasonStats(model.FederationUpdate),
-		})
-		syncLog.Debugf("Triggered XDS push for federation update")
+	select {
+	case sp.incomingCh <- msg:
+	case <-sp.stopCh:
 	}
 }

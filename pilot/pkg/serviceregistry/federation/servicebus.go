@@ -62,6 +62,17 @@ type ServiceBusTransport struct {
 	// New istiods bootstrap from these retained snapshots rather than requiring
 	// live peers to respond. Set to 0 to disable periodic snapshots.
 	snapshotInterval time.Duration
+
+	// bootstrapDone is closed when the bootstrap drain phase completes and
+	// the transport transitions to steady-state message processing.
+	bootstrapDone chan struct{}
+
+	// bootstrapDrainTimeout is the receive timeout used during bootstrap drain.
+	// If no messages arrive within this duration, the backlog is considered exhausted.
+	bootstrapDrainTimeout time.Duration
+
+	// bootstrapBatchSize is how many messages to request per batch during drain.
+	bootstrapBatchSize int
 }
 
 // ServiceBusConfig contains configuration for the Service Bus transport.
@@ -90,6 +101,15 @@ type ServiceBusConfig struct {
 	// SnapshotInterval controls periodic full-sync snapshot publishing.
 	// New istiods bootstrap from retained snapshots. Defaults to 5m if zero.
 	SnapshotInterval time.Duration
+
+	// BootstrapDrainTimeout is the receive timeout during bootstrap drain.
+	// If no messages arrive within this duration, the backlog is considered exhausted.
+	// Defaults to 5s if zero.
+	BootstrapDrainTimeout time.Duration
+
+	// BootstrapBatchSize is how many messages to request per batch during drain.
+	// Defaults to 100 if zero.
+	BootstrapBatchSize int
 
 	// StopCh signals shutdown.
 	StopCh chan struct{}
@@ -153,28 +173,51 @@ func NewServiceBusTransport(cfg ServiceBusConfig) (*ServiceBusTransport, error) 
 		snapshotInterval = 5 * time.Minute
 	}
 
+	drainTimeout := cfg.BootstrapDrainTimeout
+	if drainTimeout == 0 {
+		drainTimeout = 5 * time.Second
+	}
+
+	batchSize := cfg.BootstrapBatchSize
+	if batchSize == 0 {
+		batchSize = 100
+	}
+
 	return &ServiceBusTransport{
-		client:           client,
-		sender:           sender,
-		receiver:         receiver,
-		localClusterID:   cfg.LocalClusterID,
-		topicName:        cfg.TopicName,
-		subscriptionID:   cfg.SubscriptionName,
-		messageHandler:   cfg.MessageHandler,
-		snapshotInterval: snapshotInterval,
-		stopCh:           cfg.StopCh,
+		client:                client,
+		sender:                sender,
+		receiver:              receiver,
+		localClusterID:        cfg.LocalClusterID,
+		topicName:             cfg.TopicName,
+		subscriptionID:        cfg.SubscriptionName,
+		messageHandler:        cfg.MessageHandler,
+		snapshotInterval:      snapshotInterval,
+		bootstrapDone:         make(chan struct{}),
+		bootstrapDrainTimeout: drainTimeout,
+		bootstrapBatchSize:    batchSize,
+		stopCh:                cfg.StopCh,
 	}, nil
 }
 
+// Start initializes the Service Bus transport with a two-phase bootstrap:
+//
+// Phase 1 (Drain): Read all retained messages from the subscription backlog
+// without triggering individual XDS pushes. Messages are accumulated and merged
+// so that only the latest full-sync snapshot per source cluster is kept, plus
+// any incrementals newer than that snapshot.
+//
+// Phase 2 (Steady-state): Deliver the merged bootstrap state via the message
+// handler (triggering a single XDS push cycle), then switch to the live
+// receive loop where each incoming message is processed individually.
 func (t *ServiceBusTransport) Start() error {
 	if t.messageHandler == nil {
 		return fmt.Errorf("MessageHandler must be set before Start()")
 	}
 
-	// Start the receive loop
-	go t.receiveLoop()
+	// Start two-phase bootstrap, then transition to live receive loop
+	go t.bootstrapThenReceive()
 
-	// Start periodic snapshot publishing for cold-start bootstrap
+	// Start periodic snapshot publishing (waits for bootstrap to complete)
 	if t.snapshotInterval > 0 {
 		go t.snapshotLoop()
 	}
@@ -182,6 +225,155 @@ func (t *ServiceBusTransport) Start() error {
 	sbLog.Infof("Service Bus transport started: topic=%s, subscription=%s, cluster=%s",
 		t.topicName, t.subscriptionID, t.localClusterID)
 	return nil
+}
+
+// BootstrapDone returns a channel that is closed when the bootstrap drain
+// phase completes. Callers can use this to defer actions (e.g., broadcasting
+// initial full sync) until retained state has been loaded.
+func (t *ServiceBusTransport) BootstrapDone() <-chan struct{} {
+	return t.bootstrapDone
+}
+
+// bootstrapThenReceive runs the two-phase startup sequence.
+func (t *ServiceBusTransport) bootstrapThenReceive() {
+	sbLog.Info("Phase 1: draining retained messages for bootstrap")
+	retained := t.drainRetainedMessages()
+	sbLog.Infof("Phase 1 complete: drained %d retained messages", len(retained))
+
+	// Merge retained messages: keep only the latest full-sync per cluster,
+	// discard superseded snapshots and stale incrementals.
+	merged := mergeBootstrapMessages(retained)
+
+	if len(merged) > 0 {
+		sbLog.Infof("Phase 2: applying merged state from %d messages", len(merged))
+		for _, msg := range merged {
+			t.messageHandler(msg)
+		}
+	}
+
+	close(t.bootstrapDone)
+	sbLog.Info("Bootstrap complete, switching to live receive loop")
+	t.receiveLoop()
+}
+
+// drainRetainedMessages reads all currently available messages from the
+// subscription without waiting for new ones. It uses short receive timeouts
+// to detect when the backlog is exhausted: if no messages arrive within
+// bootstrapDrainTimeout, the drain is considered complete.
+func (t *ServiceBusTransport) drainRetainedMessages() []*SyncMessage {
+	var allMessages []*SyncMessage
+
+	for {
+		select {
+		case <-t.stopCh:
+			return allMessages
+		default:
+		}
+
+		ctx, cancel := context.WithTimeout(context.Background(), t.bootstrapDrainTimeout)
+		messages, err := t.receiver.ReceiveMessages(ctx, t.bootstrapBatchSize, nil)
+		cancel()
+
+		if err != nil {
+			// Context deadline exceeded means no more messages — drain complete.
+			// Other errors are transient; log and stop draining.
+			if ctx.Err() == nil {
+				sbLog.Warnf("Error during bootstrap drain, proceeding with %d messages: %v", len(allMessages), err)
+			}
+			break
+		}
+
+		if len(messages) == 0 {
+			break
+		}
+
+		for _, m := range messages {
+			var syncMsg SyncMessage
+			if err := json.Unmarshal(m.Body, &syncMsg); err != nil {
+				sbLog.Warnf("Bootstrap: failed to unmarshal message, dead-lettering: %v", err)
+				dlCtx, dlCancel := context.WithTimeout(context.Background(), 5*time.Second)
+				if dlErr := t.receiver.DeadLetterMessage(dlCtx, m, nil); dlErr != nil {
+					sbLog.Warnf("Bootstrap: failed to dead-letter message: %v", dlErr)
+				}
+				dlCancel()
+				continue
+			}
+
+			// Convert wire format to ServiceInfo (same as processMessage)
+			syncMsg.Services = make([]model.ServiceInfo, 0, len(syncMsg.WireServices))
+			for i := range syncMsg.WireServices {
+				if svc := syncMsg.WireServices[i].ToServiceInfo(); svc != nil {
+					syncMsg.Services = append(syncMsg.Services, *svc)
+				}
+			}
+
+			allMessages = append(allMessages, &syncMsg)
+
+			ackCtx, ackCancel := context.WithTimeout(context.Background(), 5*time.Second)
+			if err := t.receiver.CompleteMessage(ackCtx, m, nil); err != nil {
+				sbLog.Warnf("Bootstrap: failed to complete message: %v", err)
+			}
+			ackCancel()
+		}
+	}
+
+	return allMessages
+}
+
+// mergeBootstrapMessages reduces a list of retained messages to the minimal
+// set needed to reconstruct the latest state from each source cluster.
+//
+// For each cluster:
+//   - The latest full-sync snapshot is kept (highest version wins)
+//   - All older full syncs are discarded
+//   - Incrementals older than the latest full sync are discarded
+//   - Incrementals newer than the latest full sync are kept
+//
+// The result is ordered: each cluster's full sync first, then newer incrementals.
+// This ensures the store's version vector merge produces the correct final state.
+func mergeBootstrapMessages(messages []*SyncMessage) []*SyncMessage {
+	type clusterState struct {
+		latestFullSync    *SyncMessage
+		fullSyncVersion   uint64
+		incrementalsAfter []*SyncMessage
+	}
+
+	byCluster := make(map[cluster.ID]*clusterState)
+
+	for _, msg := range messages {
+		cid := msg.ClusterID
+		state, ok := byCluster[cid]
+		if !ok {
+			state = &clusterState{}
+			byCluster[cid] = state
+		}
+
+		version := msg.VersionVector[cid]
+
+		if msg.FullSync {
+			if version >= state.fullSyncVersion {
+				state.latestFullSync = msg
+				state.fullSyncVersion = version
+				// Incrementals before this full sync are superseded.
+				state.incrementalsAfter = nil
+			}
+		} else {
+			if version > state.fullSyncVersion {
+				state.incrementalsAfter = append(state.incrementalsAfter, msg)
+			}
+			// Incrementals at or below the full sync version are stale, skip them.
+		}
+	}
+
+	var result []*SyncMessage
+	for _, state := range byCluster {
+		if state.latestFullSync != nil {
+			result = append(result, state.latestFullSync)
+		}
+		result = append(result, state.incrementalsAfter...)
+	}
+
+	return result
 }
 
 func (t *ServiceBusTransport) Broadcast(msg *SyncMessage) error {
@@ -324,15 +516,18 @@ func (t *ServiceBusTransport) processMessage(m *azservicebus.ReceivedMessage) {
 }
 
 // snapshotLoop periodically publishes a full-sync snapshot.
-// New istiods bootstrap from these retained snapshots instead of requiring
-// live peers to respond with their state.
+// It waits for bootstrap to complete before publishing the first snapshot
+// to avoid broadcasting incomplete state.
 func (t *ServiceBusTransport) snapshotLoop() {
-	// Delay first snapshot to allow initial service population
+	// Wait for bootstrap to complete before publishing snapshots.
 	select {
-	case <-time.After(30 * time.Second):
+	case <-t.bootstrapDone:
 	case <-t.stopCh:
 		return
 	}
+
+	// Publish initial snapshot immediately after bootstrap.
+	t.publishSnapshot()
 
 	ticker := time.NewTicker(t.snapshotInterval)
 	defer ticker.Stop()
