@@ -645,7 +645,10 @@ func (a *index) Lookup(key string) []model.AddressInfo {
 	// 3. Service
 	// Service and workload lookup by Service key
 	if svc := a.lookupService(key); svc != nil {
-		res := []model.AddressInfo{svc.AsAddress}
+		// When returning a local service that also has federation workloads,
+		// merge federation SANs into the service so ztunnel can verify
+		// the identity of remote workloads via double HBONE.
+		res := []model.AddressInfo{a.augmentServiceWithFederationSANs(svc)}
 		// grab all workloads that reference this service
 		for _, w := range a.workloads.ByServiceKey.Lookup(svc.ResourceName()) {
 			res = append(res, w.AsAddress)
@@ -708,13 +711,17 @@ func (a *index) All() []model.AddressInfo {
 	for _, wl := range a.workloads.List() {
 		res = append(res, wl.AsAddress)
 	}
-	// Add all services
+	// Add all services, augmenting local services with federation SANs where applicable.
+	// Track local service keys so we can skip duplicate federation services.
+	localServiceKeys := sets.String{}
 	for _, s := range a.services.List() {
-		res = append(res, s.AsAddress)
+		localServiceKeys.Insert(s.ResourceName())
+		res = append(res, a.augmentServiceWithFederationSANs(&s))
 	}
 
-	// Add federation-synced services and workloads if registered
-	res = append(res, a.allFederationAddresses()...)
+	// Add federation-synced services and workloads, skipping services that
+	// overlap with local services (their SANs are already merged above).
+	res = append(res, a.allFederationAddresses(localServiceKeys)...)
 
 	return res
 }

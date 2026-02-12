@@ -98,19 +98,60 @@ func (a *index) lookupFederationServiceByAddress(network, ip string) *model.Serv
 }
 
 // allFederationAddresses returns all federation-synced services and workloads as AddressInfo.
-func (a *index) allFederationAddresses() []model.AddressInfo {
+// It accepts an optional set of local service keys to skip federation services that overlap
+// with local services (their SANs should be merged into the local service instead).
+func (a *index) allFederationAddresses(localServiceKeys sets.String) []model.AddressInfo {
 	if !a.federation.registered {
 		return nil
 	}
 
 	var res []model.AddressInfo
 	for _, s := range a.federation.services.List() {
+		// Skip federation services that overlap with local services.
+		// Their SANs are merged into the local service by augmentServiceWithFederationSANs.
+		if localServiceKeys.Contains(s.ResourceName()) {
+			continue
+		}
 		res = append(res, s.AsAddress)
 	}
 	for _, wl := range a.federation.workloads.List() {
 		res = append(res, wl.AsAddress)
 	}
 	return res
+}
+
+// augmentServiceWithFederationSANs checks if a federation service with the same key exists
+// and, if so, merges its SubjectAltNames into a copy of the local service.
+// This is needed because when ztunnel routes cross-network traffic via double HBONE,
+// it uses the service's SubjectAltNames as final_sans for inner tunnel TLS verification.
+// Without this, local services with remote (federation) endpoints would have empty SANs
+// and ztunnel's identity verification would fail.
+func (a *index) augmentServiceWithFederationSANs(svc *model.ServiceInfo) model.AddressInfo {
+	if !a.federation.registered {
+		return svc.AsAddress
+	}
+
+	// Check if there's a federation service with the same key that has SANs
+	fedSvc := a.federation.services.GetKey(svc.ResourceName())
+	if fedSvc == nil || len(fedSvc.Service.SubjectAltNames) == 0 {
+		return svc.AsAddress
+	}
+
+	// Merge federation SANs into a copy of the local service
+	mergedSANs := sets.New(svc.Service.SubjectAltNames...)
+	mergedSANs.InsertAll(fedSvc.Service.SubjectAltNames...)
+
+	newSvcInfo := model.ServiceInfo{
+		Service:      protomarshal.Clone(svc.Service),
+		Scope:        svc.Scope,
+		CreationTime: svc.CreationTime,
+	}
+	newSvcInfo.Service.SubjectAltNames = sets.SortedList(mergedSANs)
+	augmented := precomputeService(newSvcInfo)
+
+	log.Debugf("Augmented local service %s with federation SANs: %v", svc.Service.Hostname, augmented.Service.SubjectAltNames)
+
+	return augmented.AsAddress
 }
 
 // AllLocalNetworkGlobalServicesWithSANs returns all known globally scoped services with

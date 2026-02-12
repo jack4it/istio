@@ -17,6 +17,7 @@ package federation
 import (
 	"fmt"
 	"net/netip"
+	"strings"
 	"sync"
 
 	"google.golang.org/protobuf/types/known/wrapperspb"
@@ -29,6 +30,7 @@ import (
 	"istio.io/istio/pkg/log"
 	"istio.io/istio/pkg/network"
 	"istio.io/istio/pkg/workloadapi"
+	"k8s.io/apimachinery/pkg/types"
 )
 
 var storeLog = log.RegisterScope("federation-store", "Federation data store")
@@ -226,6 +228,10 @@ func (s *federationStore) getFederationState() ([]model.ServiceInfo, []model.Wor
 					Cluster:   cluster.ID(shard.NetworkGateway.Cluster),
 					Addr:      shard.NetworkGateway.Addr,
 					HBONEPort: shard.NetworkGateway.HBONEPort,
+					ServiceAccount: types.NamespacedName{
+						Name:      shard.NetworkGateway.ServiceAccount,
+						Namespace: shard.NetworkGateway.Namespace,
+					},
 				}
 				wlInfo := s.createSplitHorizonWorkload(localizedSvc, gw)
 				if wlInfo != nil {
@@ -257,12 +263,25 @@ func (s *federationStore) createSplitHorizonWorkload(svcInfo *model.ServiceInfo,
 	// Get trust domain - if not "cluster.local", use it, otherwise empty string
 	trustDomain := pickTrustDomain(s.trustDomainGetter)
 
+	// Extract service account from the service's SubjectAltNames for mTLS identity verification.
+	// The SANs are SPIFFE URIs like "spiffe://cluster.local/ns/<ns>/sa/<sa>".
+	// The ztunnel uses the workload's ServiceAccount+Namespace to construct the expected SAN.
+	serviceAccount := "default"
+	if len(svc.SubjectAltNames) > 0 {
+		// Parse the first SAN to extract the service account.
+		// Format: spiffe://<trust-domain>/ns/<namespace>/sa/<service-account>
+		if parts := parseSpiffeSAN(svc.SubjectAltNames[0]); parts != nil {
+			serviceAccount = parts.serviceAccount
+		}
+	}
+
 	wl := &workloadapi.Workload{
 		Uid:            uid,
 		Name:           uid,
 		Namespace:      svc.Namespace,
 		Network:        gateway.Network.String(),
 		TrustDomain:    trustDomain,
+		ServiceAccount: serviceAccount,
 		Capacity:       &wrapperspb.UInt32Value{Value: 1},
 		WorkloadType:   workloadapi.WorkloadType_POD,
 		TunnelProtocol: workloadapi.TunnelProtocol_HBONE,
@@ -467,4 +486,34 @@ func pickTrustDomain(trustDomainGetter func() string) string {
 		return td
 	}
 	return ""
+}
+
+// spiffeParts holds the components parsed from a SPIFFE URI.
+type spiffeParts struct {
+	namespace      string
+	serviceAccount string
+}
+
+// parseSpiffeSAN extracts namespace and service account from a SPIFFE URI.
+// Format: spiffe://<trust-domain>/ns/<namespace>/sa/<service-account>
+func parseSpiffeSAN(san string) *spiffeParts {
+	const prefix = "spiffe://"
+	if !strings.HasPrefix(san, prefix) {
+		return nil
+	}
+	// Strip "spiffe://<trust-domain>/"
+	rest := san[len(prefix):]
+	idx := strings.Index(rest, "/")
+	if idx < 0 {
+		return nil
+	}
+	rest = rest[idx+1:] // "ns/<namespace>/sa/<service-account>"
+	parts := strings.SplitN(rest, "/", 4)
+	if len(parts) != 4 || parts[0] != "ns" || parts[2] != "sa" {
+		return nil
+	}
+	return &spiffeParts{
+		namespace:      parts[1],
+		serviceAccount: parts[3],
+	}
 }
