@@ -18,7 +18,6 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"sync"
 	"time"
 
 	"github.com/Azure/azure-sdk-for-go/sdk/azidentity"
@@ -54,15 +53,6 @@ type ServiceBusTransport struct {
 	messageHandler func(msg *SyncMessage)
 	stopCh         chan struct{}
 
-	// fullSyncBuilder is called to build snapshot messages for periodic publishing.
-	mu              sync.RWMutex
-	fullSyncBuilder func() *SyncMessage
-
-	// snapshotInterval controls how often a full-sync snapshot is published.
-	// New istiods bootstrap from these retained snapshots rather than requiring
-	// live peers to respond. Set to 0 to disable periodic snapshots.
-	snapshotInterval time.Duration
-
 	// bootstrapDone is closed when the bootstrap drain phase completes and
 	// the transport transitions to steady-state message processing.
 	bootstrapDone chan struct{}
@@ -97,10 +87,6 @@ type ServiceBusConfig struct {
 
 	// MessageHandler processes incoming SyncMessages.
 	MessageHandler func(msg *SyncMessage)
-
-	// SnapshotInterval controls periodic full-sync snapshot publishing.
-	// New istiods bootstrap from retained snapshots. Defaults to 5m if zero.
-	SnapshotInterval time.Duration
 
 	// BootstrapDrainTimeout is the receive timeout during bootstrap drain.
 	// If no messages arrive within this duration, the backlog is considered exhausted.
@@ -168,11 +154,6 @@ func NewServiceBusTransport(cfg ServiceBusConfig) (*ServiceBusTransport, error) 
 		return nil, fmt.Errorf("failed to create receiver for subscription %s: %w", cfg.SubscriptionName, err)
 	}
 
-	snapshotInterval := cfg.SnapshotInterval
-	if snapshotInterval == 0 {
-		snapshotInterval = 5 * time.Minute
-	}
-
 	drainTimeout := cfg.BootstrapDrainTimeout
 	if drainTimeout == 0 {
 		drainTimeout = 5 * time.Second
@@ -191,7 +172,6 @@ func NewServiceBusTransport(cfg ServiceBusConfig) (*ServiceBusTransport, error) 
 		topicName:             cfg.TopicName,
 		subscriptionID:        cfg.SubscriptionName,
 		messageHandler:        cfg.MessageHandler,
-		snapshotInterval:      snapshotInterval,
 		bootstrapDone:         make(chan struct{}),
 		bootstrapDrainTimeout: drainTimeout,
 		bootstrapBatchSize:    batchSize,
@@ -216,11 +196,6 @@ func (t *ServiceBusTransport) Start() error {
 
 	// Start two-phase bootstrap, then transition to live receive loop
 	go t.bootstrapThenReceive()
-
-	// Start periodic snapshot publishing (waits for bootstrap to complete)
-	if t.snapshotInterval > 0 {
-		go t.snapshotLoop()
-	}
 
 	sbLog.Infof("Service Bus transport started: topic=%s, subscription=%s, cluster=%s",
 		t.topicName, t.subscriptionID, t.localClusterID)
@@ -380,12 +355,6 @@ func (t *ServiceBusTransport) Broadcast(msg *SyncMessage) error {
 	return t.sendMessage(msg)
 }
 
-func (t *ServiceBusTransport) SetFullSyncBuilder(builder func() *SyncMessage) {
-	t.mu.Lock()
-	defer t.mu.Unlock()
-	t.fullSyncBuilder = builder
-}
-
 // SetMessageHandler sets the handler for incoming SyncMessages.
 // This must be called before Start(). It exists to support late-binding
 // when the transport is constructed before SyncProtocol wires its handler.
@@ -515,53 +484,4 @@ func (t *ServiceBusTransport) processMessage(m *azservicebus.ReceivedMessage) {
 	}
 }
 
-// snapshotLoop periodically publishes a full-sync snapshot.
-// It waits for bootstrap to complete before publishing the first snapshot
-// to avoid broadcasting incomplete state.
-func (t *ServiceBusTransport) snapshotLoop() {
-	// Wait for bootstrap to complete before publishing snapshots.
-	select {
-	case <-t.bootstrapDone:
-	case <-t.stopCh:
-		return
-	}
 
-	// Publish initial snapshot immediately after bootstrap.
-	t.publishSnapshot()
-
-	ticker := time.NewTicker(t.snapshotInterval)
-	defer ticker.Stop()
-
-	for {
-		select {
-		case <-ticker.C:
-			t.publishSnapshot()
-		case <-t.stopCh:
-			sbLog.Info("Snapshot loop stopping")
-			return
-		}
-	}
-}
-
-// publishSnapshot builds and publishes a full-sync snapshot message.
-func (t *ServiceBusTransport) publishSnapshot() {
-	t.mu.RLock()
-	builder := t.fullSyncBuilder
-	t.mu.RUnlock()
-
-	if builder == nil {
-		return
-	}
-
-	msg := builder()
-	if msg == nil {
-		return
-	}
-
-	if err := t.sendMessage(msg); err != nil {
-		sbLog.Warnf("Failed to publish snapshot: %v", err)
-		return
-	}
-
-	sbLog.Infof("Published full-sync snapshot: %d services", len(msg.Services))
-}

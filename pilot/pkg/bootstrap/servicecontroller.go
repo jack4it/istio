@@ -128,7 +128,6 @@ func (s *Server) initFederationSync(args *PilotArgs, serviceControllers *aggrega
 		TopicName:               features.ServiceBusTopic,
 		SubscriptionName:        subscriptionName,
 		LocalClusterID:          s.clusterID,
-		SnapshotInterval:        features.ServiceBusSnapshotInterval,
 		StopCh:                  stopCh,
 		MessageHandler:          nil, // Set by SyncProtocol before Start()
 	})
@@ -154,9 +153,10 @@ func (s *Server) initFederationSync(args *PilotArgs, serviceControllers *aggrega
 		TrustDomainGetter: func() string {
 			return s.environment.Mesh().GetTrustDomain()
 		},
-		XDSUpdater: s.XDSServer,
-		Transport:  sbTransport,
-		StopCh:     stopCh,
+		XDSUpdater:       s.XDSServer,
+		SnapshotInterval: features.ServiceBusSnapshotInterval,
+		Transport:        sbTransport,
+		StopCh:           stopCh,
 	})
 	if err != nil {
 		return fmt.Errorf("failed to create sync protocol: %w", err)

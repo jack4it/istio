@@ -76,18 +76,37 @@ type SyncProtocol struct {
 	// xdsUpdater triggers XDS pushes when federation collections change.
 	xdsUpdater model.XDSUpdater
 
+	// snapshotInterval controls how often a full-sync snapshot is published.
+	snapshotInterval time.Duration
+
 	// incomingCh buffers incoming messages for debounced processing.
 	// Messages are applied to the store immediately but KRT collection
 	// resets and XDS pushes are batched.
 	incomingCh chan *SyncMessage
 
+	// outgoingCh buffers local service change events for debounced broadcasting.
+	// Events are deduplicated per hostname and batched into a single SyncMessage.
+	outgoingCh chan outgoingEvent
+
 	// stopCh signals shutdown.
 	stopCh chan struct{}
+}
+
+// outgoingEvent represents a local service change to be broadcast to peers.
+type outgoingEvent struct {
+	service  *model.ServiceInfo // non-nil for add/update, nil for delete
+	hostname string             // set for delete events
+	event    model.Event
 }
 
 // SyncProtocolConfig contains configuration for the sync protocol.
 type SyncProtocolConfig struct {
 	LocalClusterID cluster.ID
+
+	// SnapshotInterval controls how often a full-sync snapshot is published
+	// to Service Bus. New istiods bootstrap from these retained snapshots.
+	// Defaults to 5m if zero. Set negative to disable.
+	SnapshotInterval time.Duration
 
 	// AmbientIndexGetter returns the ambient index for direct integration.
 	// This is a getter to support deferred initialization — the ambient index
@@ -158,6 +177,11 @@ func NewSyncProtocol(cfg SyncProtocolConfig) (*SyncProtocol, error) {
 		krt.WithStop(cfg.StopCh),
 	)
 
+	snapshotInterval := cfg.SnapshotInterval
+	if snapshotInterval == 0 {
+		snapshotInterval = 5 * time.Minute
+	}
+
 	sp := &SyncProtocol{
 		store:                     store,
 		localClusterID:            cfg.LocalClusterID,
@@ -168,7 +192,9 @@ func NewSyncProtocol(cfg SyncProtocolConfig) (*SyncProtocol, error) {
 		federationWorkloads:       federationWorkloads,
 		localNetworkGatewayGetter: cfg.LocalNetworkGatewayGetter,
 		xdsUpdater:                cfg.XDSUpdater,
+		snapshotInterval:          snapshotInterval,
 		incomingCh:                make(chan *SyncMessage, 100),
+		outgoingCh:                make(chan outgoingEvent, 100),
 		stopCh:                    cfg.StopCh,
 		transport:                 cfg.Transport,
 	}
@@ -178,9 +204,6 @@ func NewSyncProtocol(cfg SyncProtocolConfig) (*SyncProtocol, error) {
 	cfg.Transport.SetMessageHandler(func(msg *SyncMessage) {
 		sp.handleIncomingMessage(msg)
 	})
-
-	// Wire up the full sync builder for periodic snapshots
-	cfg.Transport.SetFullSyncBuilder(sp.buildFullSyncMessage)
 
 	return sp, nil
 }
@@ -199,9 +222,11 @@ func (sp *SyncProtocol) Start() error {
 	}
 	syncLog.Info("Transport started")
 
-	// Start the debounced message processor. All incoming messages flow
-	// through incomingCh and are batched before updating KRT collections.
+	// Start debounced message processors for both directions.
+	// Inbound: messages → store → (debounce) → KRT + XDS push
+	// Outbound: ambient events → (debounce) → batched SyncMessage → transport
 	go sp.processIncomingDebounced()
+	go sp.processOutgoingDebounced()
 
 	// Get ambient index — may be nil if not yet available or not enabled
 	if sp.ambientIndexGetter != nil {
@@ -216,10 +241,8 @@ func (sp *SyncProtocol) Start() error {
 		// 3. Register for push-based global service change events
 		sp.ambientIndex.RegisterGlobalServiceHandler(func(prev, curr *model.ServiceInfo, event model.Event) {
 			switch event {
-			case model.EventAdd:
-				sp.handleServiceAdd(curr)
-			case model.EventUpdate:
-				sp.handleServiceUpdate(curr)
+			case model.EventAdd, model.EventUpdate:
+				sp.handleServiceUpsert(curr)
 			case model.EventDelete:
 				if prev != nil && prev.Service != nil {
 					sp.handleServiceDelete(prev.Service.Hostname)
@@ -228,19 +251,11 @@ func (sp *SyncProtocol) Start() error {
 		})
 		syncLog.Info("Registered for push-based global service events")
 
-		// 4. Wait for bootstrap to complete, then send initial full sync.
-		// The transport's two-phase bootstrap drains retained messages first,
-		// so we don't broadcast until we've loaded remote state.
-		go func() {
-			select {
-			case <-sp.transport.BootstrapDone():
-				syncLog.Info("Bootstrap complete, sending initial full sync")
-				msg := sp.buildFullSyncMessage()
-				sp.broadcast(msg)
-			case <-sp.stopCh:
-				return
-			}
-		}()
+		// 4. Start the snapshot loop, which waits for bootstrap to complete,
+		// sends an initial full sync, then publishes periodic snapshots.
+		if sp.snapshotInterval > 0 {
+			go sp.snapshotLoop()
+		}
 	} else {
 		syncLog.Warn("No ambient index available — federation sync will only exchange peer metadata")
 	}
@@ -252,6 +267,45 @@ func (sp *SyncProtocol) Start() error {
 // Stop gracefully stops the sync protocol.
 func (sp *SyncProtocol) Stop() error {
 	return sp.transport.Shutdown()
+}
+
+// snapshotLoop waits for bootstrap to complete, then publishes an initial
+// full-sync snapshot and repeats at snapshotInterval. This provides the
+// retained messages that new istiods drain during their own bootstrap.
+func (sp *SyncProtocol) snapshotLoop() {
+	// Wait for bootstrap to complete before publishing snapshots.
+	select {
+	case <-sp.transport.BootstrapDone():
+	case <-sp.stopCh:
+		return
+	}
+
+	// Publish initial snapshot immediately after bootstrap.
+	syncLog.Info("Bootstrap complete, publishing initial full sync")
+	sp.publishSnapshot()
+
+	ticker := time.NewTicker(sp.snapshotInterval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ticker.C:
+			sp.publishSnapshot()
+		case <-sp.stopCh:
+			syncLog.Info("Snapshot loop stopping")
+			return
+		}
+	}
+}
+
+// publishSnapshot builds and publishes a full-sync snapshot message.
+func (sp *SyncProtocol) publishSnapshot() {
+	msg := sp.buildFullSyncMessage()
+	if msg == nil {
+		return
+	}
+	sp.broadcast(msg)
+	syncLog.Infof("Published full-sync snapshot: %d services", len(msg.Services))
 }
 
 // broadcast sends a sync message to all peers via Service Bus.
@@ -309,89 +363,119 @@ func (sp *SyncProtocol) buildFullSyncMessage() *SyncMessage {
 	return msg
 }
 
-// handleServiceAdd handles a new global service being added locally.
-func (sp *SyncProtocol) handleServiceAdd(svc *model.ServiceInfo) {
-	if svc == nil {
+// handleServiceUpsert enqueues a service add or update for debounced broadcasting.
+func (sp *SyncProtocol) handleServiceUpsert(svc *model.ServiceInfo) {
+	if svc == nil || svc.Scope != model.Global {
 		return
 	}
 
-	// Only sync global services
-	if svc.Scope != model.Global {
-		return
+	syncLog.Debugf("Enqueuing service upsert: %s", svc.Service.Hostname)
+
+	select {
+	case sp.outgoingCh <- outgoingEvent{service: svc, event: model.EventUpdate}:
+	case <-sp.stopCh:
 	}
-
-	syncLog.Debugf("Broadcasting service add: %s", svc.Service.Hostname)
-
-	// Get service with SANs populated
-	svcWithSANs := sp.ambientIndex.ServiceWithSANs(svc)
-	if svcWithSANs == nil {
-		svcWithSANs = svc
-	}
-
-	version := sp.versionVector.increment(sp.localClusterID)
-
-	msg := &SyncMessage{
-		VersionVector:  sp.versionVector.copy(),
-		FullSync:       false,
-		ClusterID:      sp.localClusterID,
-		NetworkGateway: sp.getLocalNetworkGateway(),
-		Services:       []model.ServiceInfo{*svcWithSANs},
-	}
-
-	sp.broadcast(msg)
-	syncLog.Debugf("Broadcasted service add at version %d", version)
 }
 
-// handleServiceUpdate handles a global service being updated locally.
-func (sp *SyncProtocol) handleServiceUpdate(svc *model.ServiceInfo) {
-	if svc == nil {
-		return
-	}
-
-	// Only sync global services
-	if svc.Scope != model.Global {
-		return
-	}
-
-	syncLog.Debugf("Broadcasting service update: %s", svc.Service.Hostname)
-
-	// Get service with SANs populated
-	svcWithSANs := sp.ambientIndex.ServiceWithSANs(svc)
-	if svcWithSANs == nil {
-		svcWithSANs = svc
-	}
-
-	version := sp.versionVector.increment(sp.localClusterID)
-
-	msg := &SyncMessage{
-		VersionVector:  sp.versionVector.copy(),
-		FullSync:       false,
-		ClusterID:      sp.localClusterID,
-		NetworkGateway: sp.getLocalNetworkGateway(),
-		Services:       []model.ServiceInfo{*svcWithSANs},
-	}
-
-	sp.broadcast(msg)
-	syncLog.Debugf("Broadcasted service update at version %d", version)
-}
-
-// handleServiceDelete handles a global service being deleted locally.
+// handleServiceDelete enqueues a service deletion for debounced broadcasting.
 func (sp *SyncProtocol) handleServiceDelete(hostname string) {
-	syncLog.Debugf("Broadcasting service delete: %s", hostname)
+	syncLog.Debugf("Enqueuing service delete: %s", hostname)
 
-	version := sp.versionVector.increment(sp.localClusterID)
-
-	tombstone := sp.tombstones.add(hostname, sp.localClusterID, version)
-
-	msg := &SyncMessage{
-		VersionVector: sp.versionVector.copy(),
-		FullSync:      false,
-		ClusterID:     sp.localClusterID,
-		Tombstones:    []Tombstone{tombstone},
+	select {
+	case sp.outgoingCh <- outgoingEvent{hostname: hostname, event: model.EventDelete}:
+	case <-sp.stopCh:
 	}
+}
 
-	sp.broadcast(msg)
-	syncLog.Debugf("Broadcasted service delete tombstone at version %d", version)
+// processOutgoingDebounced batches local service change events and broadcasts
+// them as a single SyncMessage. Events are deduplicated per hostname (last
+// event wins), so rapid-fire updates from deployments produce one message.
+func (sp *SyncProtocol) processOutgoingDebounced() {
+	for {
+		var ev outgoingEvent
+		select {
+		case ev = <-sp.outgoingCh:
+		case <-sp.stopCh:
+			return
+		}
+
+		// Accumulate events, deduplicating by hostname (last event wins).
+		pendingServices := make(map[string]*model.ServiceInfo)
+		pendingDeletes := make(map[string]struct{})
+
+		applyEvent := func(e outgoingEvent) {
+			if e.event == model.EventDelete {
+				delete(pendingServices, e.hostname)
+				pendingDeletes[e.hostname] = struct{}{}
+			} else {
+				svc := e.service
+				if sp.ambientIndex != nil {
+					if enriched := sp.ambientIndex.ServiceWithSANs(svc); enriched != nil {
+						svc = enriched
+					}
+				}
+				hostname := string(svc.Service.Hostname)
+				delete(pendingDeletes, hostname)
+				pendingServices[hostname] = svc
+			}
+		}
+
+		applyEvent(ev)
+
+		quietTimer := time.NewTimer(debounceAfter)
+		maxTimer := time.NewTimer(debounceMax)
+
+	drain:
+		for {
+			select {
+			case ev = <-sp.outgoingCh:
+				applyEvent(ev)
+				if !quietTimer.Stop() {
+					<-quietTimer.C
+				}
+				quietTimer.Reset(debounceAfter)
+			case <-quietTimer.C:
+				break drain
+			case <-maxTimer.C:
+				break drain
+			case <-sp.stopCh:
+				quietTimer.Stop()
+				maxTimer.Stop()
+				return
+			}
+		}
+		quietTimer.Stop()
+		maxTimer.Stop()
+
+		if len(pendingServices) == 0 && len(pendingDeletes) == 0 {
+			continue
+		}
+
+		version := sp.versionVector.increment(sp.localClusterID)
+
+		var services []model.ServiceInfo
+		for _, svc := range pendingServices {
+			services = append(services, *svc)
+		}
+
+		var tombstones []Tombstone
+		for hostname := range pendingDeletes {
+			tombstones = append(tombstones, sp.tombstones.add(hostname, sp.localClusterID, version))
+		}
+
+		msg := &SyncMessage{
+			VersionVector:  sp.versionVector.copy(),
+			FullSync:       false,
+			ClusterID:      sp.localClusterID,
+			NetworkGateway: sp.getLocalNetworkGateway(),
+			Services:       services,
+			Tombstones:     tombstones,
+		}
+
+		sp.broadcast(msg)
+		syncLog.Infof("Flushed debounced outgoing broadcast: %d services, %d deletes, version=%d",
+			len(services), len(tombstones), version)
+	}
 }
 
 // processIncomingDebounced is the main loop for debounced message processing.
