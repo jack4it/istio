@@ -260,7 +260,7 @@ func (s *federationStore) createSplitHorizonWorkload(svcInfo *model.ServiceInfo,
 		hboneMtlsPort = 15008
 	}
 
-	// Get trust domain - if not "cluster.local", use it, otherwise empty string
+	// Get trust domain for workload identity (defaults to "cluster.local")
 	trustDomain := pickTrustDomain(s.trustDomainGetter)
 
 	// Extract service account from the service's SubjectAltNames for mTLS identity verification.
@@ -479,13 +479,12 @@ func generateSplitHorizonWorkloadUID(networkID, gatewayName, service string) str
 }
 
 func pickTrustDomain(trustDomainGetter func() string) string {
-	if trustDomainGetter == nil {
-		return ""
+	if trustDomainGetter != nil {
+		if td := trustDomainGetter(); td != "" {
+			return td
+		}
 	}
-	if td := trustDomainGetter(); td != "cluster.local" {
-		return td
-	}
-	return ""
+	return "cluster.local"
 }
 
 // spiffeParts holds the components parsed from a SPIFFE URI.

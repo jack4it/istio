@@ -67,3 +67,4 @@ coverage.out
 /cni/pkg/plugin/istio-cni.log
 .wiki
 artifacts
+DS/
