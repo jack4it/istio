@@ -485,9 +485,14 @@ func (t *ServiceBusTransport) ensureSubscription() error {
 	ctx, cancel := context.WithTimeout(t.stopCtx, 30*time.Second)
 	defer cancel()
 
-	// Check if subscription already exists (pod restart with same name)
-	_, err := t.adminClient.GetSubscription(ctx, t.topicName, t.subscriptionName, nil)
-	if err == nil {
+	// Check if subscription already exists (pod restart with same name).
+	// NOTE: GetSubscription returns (nil, nil) when the entity does not exist,
+	// so we must check the response pointer, not just the error.
+	resp, err := t.adminClient.GetSubscription(ctx, t.topicName, t.subscriptionName, nil)
+	if err != nil {
+		return fmt.Errorf("check subscription %s: %w", t.subscriptionName, err)
+	}
+	if resp != nil {
 		sbLog.Infof("Subscription %s already exists, reusing", t.subscriptionName)
 		return nil
 	}
