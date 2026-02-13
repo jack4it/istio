@@ -79,11 +79,15 @@ var (
 		false,
 		"If enabled, selector based authorization policies will be enforced as L4 policies in front of the waypoint.").Get()
 
-	FederationLocalNetwork = env.Register("PILOT_FEDERATION_LOCAL_NETWORK", "",
-		"The network ID of the local cluster for federation. Used to identify which network gateway to sync.").Get()
+	// --- Federation: Azure Service Bus multi-cluster sync ---
 
 	EnableFederation = registerAmbient("PILOT_ENABLE_FEDERATION", false, false,
 		"If enabled, istiod will use Azure Service Bus pub/sub to synchronize ambient global services with peer istiod instances.")
+
+	FederationLocalNetwork = env.Register("PILOT_FEDERATION_LOCAL_NETWORK", "",
+		"The network ID of the local cluster for federation. Used to identify which network gateway to sync.").Get()
+
+	// Service Bus connection settings (provide connection string OR namespace for Workload Identity).
 
 	ServiceBusConnectionString = env.Register("PILOT_SERVICEBUS_CONNECTION_STRING", "",
 		"Azure Service Bus connection string. If empty, Azure Workload Identity (DefaultAzureCredential) is used.").Get()
@@ -92,20 +96,24 @@ var (
 		"Fully qualified Azure Service Bus namespace (e.g., 'istio-fed.servicebus.windows.net'). "+
 			"Used when authenticating via Workload Identity instead of connection string.").Get()
 
+	// Service Bus topic and subscription settings.
+
 	ServiceBusTopic = env.Register("PILOT_SERVICEBUS_TOPIC", "istio-service-sync",
 		"The Service Bus topic name for federation sync messages.").Get()
 
 	ServiceBusSubscription = env.Register("PILOT_SERVICEBUS_SUBSCRIPTION", "",
 		"This cluster's subscription name on the Service Bus topic. Should be unique per cluster (defaults to cluster ID).").Get()
 
-	ServiceBusSnapshotInterval = env.Register("PILOT_SERVICEBUS_SNAPSHOT_INTERVAL", 5*time.Minute,
-		"How often to publish a full-sync snapshot to Service Bus for cold-start bootstrap of new istiod instances.").Get()
-
 	ServiceBusAutoCreateSubscription = env.Register("PILOT_SERVICEBUS_AUTO_CREATE_SUBSCRIPTION", false,
 		"If true, each istiod replica auto-creates its own Service Bus subscription (<clusterID>-<podName>) "+
 			"with autoDeleteOnIdle=30m for HA multi-replica deployments. Requires 'Manage' claim or "+
 			"'Azure Service Bus Data Owner' role. When false, all replicas share a single pre-provisioned "+
 			"subscription — only correct for single-replica deployments.").Get()
+
+	// Operational tuning.
+
+	ServiceBusSnapshotInterval = env.Register("PILOT_SERVICEBUS_SNAPSHOT_INTERVAL", 5*time.Minute,
+		"How often to publish a full-sync snapshot to Service Bus for cold-start bootstrap of new istiod instances.").Get()
 )
 
 // registerAmbient registers a variable that is allowed only if EnableAmbient is set
