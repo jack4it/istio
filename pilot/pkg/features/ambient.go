@@ -108,14 +108,10 @@ var (
 	ServiceBusTopic = env.Register("PILOT_SERVICEBUS_TOPIC", "istio-service-sync",
 		"The Service Bus topic name for federation sync messages.").Get()
 
-	ServiceBusSubscription = env.Register("PILOT_SERVICEBUS_SUBSCRIPTION", "",
-		"This cluster's subscription name on the Service Bus topic. Should be unique per cluster (defaults to cluster ID).").Get()
-
-	ServiceBusAutoCreateSubscription = env.Register("PILOT_SERVICEBUS_AUTO_CREATE_SUBSCRIPTION", false,
-		"If true, each istiod replica auto-creates its own Service Bus subscription (<clusterID>-<podName>) "+
-			"with autoDeleteOnIdle=30m for HA multi-replica deployments. Requires 'Manage' claim or "+
-			"'Azure Service Bus Data Owner' role. When false, all replicas share a single pre-provisioned "+
-			"subscription — only correct for single-replica deployments.").Get()
+	ServiceBusBootstrapSubscription = env.Register("PILOT_SERVICEBUS_BOOTSTRAP_SUBSCRIPTION", "federation-bootstrap",
+		"The shared pre-provisioned subscription used for peek-based cold-start bootstrap. "+
+			"All clusters peek this subscription non-destructively to load retained snapshots on startup. "+
+			"Must be pre-provisioned with no SQL filter so messages from all clusters accumulate.").Get()
 
 	// Operational tuning.
 

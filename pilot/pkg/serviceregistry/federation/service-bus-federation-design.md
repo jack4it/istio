@@ -57,21 +57,31 @@ This separation means the protocol layer can be backed by any pub/sub broker (Ka
 
 ### Topics and Subscriptions
 
-| Topic | Purpose | Message Type | Subscription Strategy |
-|---|---|---|---|
-| `istio-service-sync` | Service add/update/delete + gateway changes | `SyncMessage` (JSON envelope + protobuf services + gateway info) | Per-cluster subscription with SQL filter: `ClusterID <> '<self>'` |
+**Topic:** `istio-service-sync` — carries service add/update/delete events and gateway changes as `SyncMessage` (JSON envelope + protobuf services + gateway info).
 
 Gateway info is included in every `SyncMessage` as the `NetworkGateway` field. A separate topic is unnecessary — gateway changes are rare and bundled with service syncs.
 
 Messages are JSON-serialized `SyncMessage` structs (services as protobuf bytes in `WireServiceInfo`). Application properties (`ClusterID`, `FullSync`, `Version`) enable subscription-level filtering and bootstrap merge logic.
 
+**Subscriptions:** The system uses two subscription types:
+
+| Subscription | Created by | Consumed by | Purpose |
+|---|---|---|---|
+| **Shared bootstrap** (`federation-bootstrap`) | Pre-provisioned (Bicep/Terraform), **no SQL filter** | All clusters: peek-only for cold-start bootstrap | Accumulates snapshots from all clusters via TTL. Never actively consumed — every cluster peeks non-destructively. Self-messages filtered in code. |
+| **Per-replica** (e.g. `cluster1-istiod-abc123`) | Auto-created at startup | That replica only | Steady-state receive. Starts empty — not used for bootstrap. SQL filter excludes self-messages. Deleted on graceful shutdown, `autoDeleteOnIdle=30m` handles crashes. |
+
+Per-replica subscriptions use a SQL filter (`ClusterID <> '<self>'`) to exclude the local cluster's own messages. The shared bootstrap subscription has **no SQL filter** — it must receive messages from all clusters (including self) so that any cluster can peek the full history. Self-messages are filtered in application code during the peek loop.
+
 ### Cold-Start Bootstrap (Two-Phase)
 
-Cold-start bootstrap uses a **two-phase drain-and-merge** strategy with Service Bus message retention:
+Cold-start bootstrap uses a **two-phase peek-and-merge** strategy:
 
-**Phase 1 — Drain:** When a new Istiod starts, the transport reads all retained messages from its subscription in batches using short timeouts (5 s). Messages are accumulated in memory without triggering XDS pushes or KRT collection updates.
+- Per-replica subscriptions are freshly created and empty. Bootstrap **peeks** (non-destructive read) from the shared `federation-bootstrap` subscription, which has no SQL filter and accumulates snapshots from all clusters via TTL. Self-messages are skipped in code. All replicas across all clusters can peek simultaneously without interference.
+- **First-ever startup**: The bootstrap subscription is empty — no state to bootstrap from. This is correct; the cluster begins with no federation knowledge and discovers remote services as they publish.
 
-**Phase 2 — Merge and Apply:** The retained messages are merged per source cluster:
+**Phase 1 — Peek retained messages:** The transport peeks all available messages using short timeouts (5 s). Messages are accumulated in memory without triggering XDS pushes or KRT collection updates.
+
+**Phase 2 — Merge and Apply:** Retained messages are merged per source cluster:
 - Only the **latest full-sync snapshot** per cluster is kept (highest version vector value)
 - Stale full syncs and superseded incrementals are discarded
 - Incrementals newer than the latest full sync are kept
@@ -129,16 +139,16 @@ This provides **two layers of batching:**
 | `debounceMax` | 2 s | Maximum wait — bounds worst-case latency during sustained updates |
 | `channel capacity` | 100 | Absorbs bursts without blocking the receive loop |
 
-### Multi-Replica HA
+### Multi-Replica Support
 
-Istiod runs multiple replicas per cluster. Federation uses **Istio's existing leader election** to designate one replica as the active publisher:
+Istiod runs multiple replicas per cluster. Every replica is identical — all replicas bootstrap, receive, and hydrate the federation store. The **leader** has one extra responsibility: publishing.
 
-- **Leader:** Publishes snapshots and incrementals, creates and manages the shared subscription
-- **Non-leader replicas:** Receive messages via a separate **per-replica subscription** (auto-created with `autoDeleteOnIdle=30m`) for store hydration, but do not publish
+- **All replicas:** Bootstrap by peeking the shared `federation-bootstrap` subscription, then receive messages via their own **per-replica subscription** (auto-created with `autoDeleteOnIdle=30m`) for continuous store hydration
+- **Leader (additional responsibility):** Publishes snapshots and incrementals to the topic. Activated via Istio's existing leader election; all other behavior is the same as non-leaders.
 
-This means every replica has current federation state for fast leader failover. On leadership change, the new leader begins publishing immediately — no cold-start delay.
+Because every replica maintains current federation state, leader failover is instant — the new leader begins publishing immediately with no cold-start delay.
 
-**Competing consumers on the shared subscription** are avoided by having non-leaders use their own ephemeral subscriptions. If non-leaders shared the leader's subscription, messages would be split across replicas nondeterministically.
+**Competing consumers** are avoided by giving each replica its own subscription. If all replicas shared one subscription, `ReceiveMessages` would split messages across replicas nondeterministically.
 
 **Version vector conflicts** from leadership changes are handled naturally: the version vector is per-cluster (not per-replica), so a new leader's first snapshot carries the correct cluster-level version.
 
@@ -193,11 +203,10 @@ Federation only replaces the **control plane service discovery transport** (how 
 | `PILOT_SERVICEBUS_CONNECTION_STRING` | Service Bus connection string | `Endpoint=sb://istio-fed.servicebus.windows.net/;...` |
 | `PILOT_SERVICEBUS_NAMESPACE` | FQDN (for Workload Identity auth) | `istio-fed.servicebus.windows.net` |
 | `PILOT_SERVICEBUS_TOPIC` | Topic name | `istio-service-sync` |
-| `PILOT_SERVICEBUS_SUBSCRIPTION` | Subscription name (defaults to cluster ID) | `cluster1` |
-| `PILOT_SERVICEBUS_AUTO_CREATE_SUBSCRIPTION` | Auto-create subscription on startup | `true` |
+| `PILOT_SERVICEBUS_BOOTSTRAP_SUBSCRIPTION` | Shared bootstrap subscription name | `federation-bootstrap` |
 | `PILOT_SERVICEBUS_SNAPSHOT_INTERVAL` | Full-sync publish interval | `5m` |
 
-**Authentication:** Prefer **Azure Workload Identity** (federated OIDC) over connection strings. Each AKS cluster's Istiod ServiceAccount is federated to an Azure Managed Identity with `Azure Service Bus Data Sender` and `Azure Service Bus Data Receiver` roles. No secrets to rotate.
+**Authentication:** Prefer **Azure Workload Identity** (federated OIDC) over connection strings. Each AKS cluster's Istiod ServiceAccount is federated to an Azure Managed Identity with `Azure Service Bus Data Owner` role on the namespace (covers send, receive, and subscription management). No secrets to rotate.
 
 ---
 

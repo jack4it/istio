@@ -109,10 +109,10 @@ func (s *Server) initKubeRegistry(args *PilotArgs) (err error) {
 // initFederationSync initializes Service Bus–based federation.
 // This enables pub/sub synchronization of ambient global services via Azure Service Bus.
 //
-// Multi-replica HA behavior:
-//   - When AutoCreateSubscription is true, each replica creates its own Service Bus
-//     subscription (<clusterID>-<podName>) with autoDeleteOnIdle=30m, ensuring all
-//     replicas receive ALL inbound messages and maintain complete federation state.
+// Multi-replica behavior:
+//   - Each replica auto-creates its own Service Bus subscription (<clusterID>-<podName>)
+//     with autoDeleteOnIdle=30m, ensuring all replicas receive ALL inbound messages
+//     and maintain complete federation state. Bootstrap peeks from a shared subscription.
 //   - Leader election gates outbound publishing: only the leader publishes snapshots
 //     and service change events to Service Bus. All replicas process inbound messages.
 //   - Version vectors use max(counter+1, time.Now().UnixMilli()) to ensure a new
@@ -125,32 +125,25 @@ func (s *Server) initFederationSync(args *PilotArgs, serviceControllers *aggrega
 	// Get local network from feature flag
 	localNetwork := network.ID(features.FederationLocalNetwork)
 
-	// Determine subscription name.
-	// With AutoCreateSubscription: <clusterID>-<podName> (unique per replica)
-	// Without: explicit config or cluster ID (shared by all replicas — single-replica only)
-	subscriptionName := features.ServiceBusSubscription
-	if features.ServiceBusAutoCreateSubscription {
-		// Per-replica subscription for HA deployments
-		podName := args.PodName
-		if podName == "" {
-			podName = "default"
-		}
-		subscriptionName = string(s.clusterID) + "-" + podName
-		log.Infof("Using per-replica subscription: %s", subscriptionName)
-	} else if subscriptionName == "" {
-		subscriptionName = string(s.clusterID)
+	// Determine subscription name: <clusterID>-<podName> (unique per replica).
+	// Each replica auto-creates its own subscription with autoDeleteOnIdle=30m.
+	podName := args.PodName
+	if podName == "" {
+		podName = "default"
 	}
+	subscriptionName := string(s.clusterID) + "-" + podName
+	log.Infof("Using per-replica subscription: %s", subscriptionName)
 
 	// Create the Service Bus transport
 	sbTransport, err := federation.NewServiceBusTransport(federation.ServiceBusConfig{
-		ConnectionString:        features.ServiceBusConnectionString,
-		FullyQualifiedNamespace: features.ServiceBusNamespace,
-		TopicName:               features.ServiceBusTopic,
-		SubscriptionName:        subscriptionName,
-		LocalClusterID:          s.clusterID,
-		AutoCreateSubscription:  features.ServiceBusAutoCreateSubscription,
-		StopCh:                  stopCh,
-		MessageHandler:          nil, // Set by SyncProtocol before Start()
+		ConnectionString:          features.ServiceBusConnectionString,
+		FullyQualifiedNamespace:   features.ServiceBusNamespace,
+		TopicName:                 features.ServiceBusTopic,
+		SubscriptionName:          subscriptionName,
+		LocalClusterID:            s.clusterID,
+		BootstrapSubscriptionName: features.ServiceBusBootstrapSubscription,
+		StopCh:                    stopCh,
+		MessageHandler:            nil, // Set by SyncProtocol before Start()
 	})
 	if err != nil {
 		return fmt.Errorf("failed to create Service Bus transport: %w", err)
