@@ -33,6 +33,7 @@ import (
 	"istio.io/istio/pkg/test/framework/components/echo/deployment"
 	"istio.io/istio/pkg/test/framework/components/echo/match"
 	"istio.io/istio/pkg/test/framework/components/namespace"
+	"istio.io/istio/pkg/test/framework/resource"
 	"istio.io/istio/pkg/test/util/retry"
 )
 
@@ -171,10 +172,17 @@ func deployEchoOrFail(t framework.TestContext, serviceName string, healthy, unhe
 
 	echos := builder.BuildOrFail(t)
 
-	// NOTE: We cannot just specify replicas 0, because the way the Deployment config template is written
-	// it treats 0 as unset value and defaults to 1 replica in that case defeating the point of setting
-	// replicas to 0 explicitly.
-	scaleDeploymentOrFail(t, unhealthy, ns.Name(), fmt.Sprintf("%s-%s", broken, broken), 0)
+	settings, err := resource.SettingsFromCommandLine("multinetwork")
+	if err != nil {
+		t.Fatalf("failed to get settings from command line: %v", err)
+	}
+
+	for rev := range settings.Revisions {
+		// NOTE: We cannot just specify replicas 0, because the way the Deployment config template is written
+		// it treats 0 as unset value and defaults to 1 replica in that case defeating the point of setting
+		// replicas to 0 explicitly.
+		scaleDeploymentOrFail(t, unhealthy, ns.Name(), fmt.Sprintf("%s-%s-%s", broken, broken, rev), 0)
+	}
 
 	return match.ServiceName(echo.NamespacedName{Name: client, Namespace: ns}).GetMatches(echos)
 }

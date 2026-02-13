@@ -48,7 +48,13 @@ func TestZtunnelConfig(t *testing.T) {
 			}
 
 			args := []string{
-				"zc", "all", podName, "-o", "json",
+				"zc",
+				"all",
+				"-n",
+				istioCfg.SystemNamespace,
+				podName,
+				"-o",
+				"json",
 			}
 			var zDumpAll configdump.ZtunnelDump
 			out, _ := istioCtl.InvokeOrFail(t, args)
@@ -62,7 +68,13 @@ func TestZtunnelConfig(t *testing.T) {
 
 			var zDump configdump.ZtunnelDump
 			args = []string{
-				"zc", "services", podName, "-o", "json",
+				"zc",
+				"services",
+				"-n",
+				istioCfg.SystemNamespace,
+				podName,
+				"-o",
+				"json",
 			}
 			out, _ = istioCtl.InvokeOrFail(t, args)
 			err = unmarshalListOrMap([]byte(out), &zDump.Services)
@@ -70,7 +82,13 @@ func TestZtunnelConfig(t *testing.T) {
 			g.Expect(zDump.Services).To(Not(BeNil()))
 
 			args = []string{
-				"zc", "workloads", podName, "-o", "json",
+				"zc",
+				"workloads",
+				"-n",
+				istioCfg.SystemNamespace,
+				podName,
+				"-o",
+				"json",
 			}
 			out, _ = istioCtl.InvokeOrFail(t, args)
 			err = unmarshalListOrMap([]byte(out), &zDump.Workloads)
@@ -78,7 +96,13 @@ func TestZtunnelConfig(t *testing.T) {
 			g.Expect(zDump.Workloads).To(Not(BeNil()))
 
 			args = []string{
-				"zc", "policies", podName, "-o", "json",
+				"zc",
+				"policies",
+				"-n",
+				istioCfg.SystemNamespace,
+				podName,
+				"-o",
+				"json",
 			}
 			out, _ = istioCtl.InvokeOrFail(t, args)
 			err = unmarshalListOrMap([]byte(out), &zDump.Policies)
@@ -86,7 +110,13 @@ func TestZtunnelConfig(t *testing.T) {
 			g.Expect(zDump.Policies).To(Not(BeNil()))
 
 			args = []string{
-				"zc", "certificates", podName, "-o", "json",
+				"zc",
+				"certificates",
+				"-n",
+				istioCfg.SystemNamespace,
+				podName,
+				"-o",
+				"json",
 			}
 			out, _ = istioCtl.InvokeOrFail(t, args)
 			err = unmarshalListOrMap([]byte(out), &zDump.Certificates)
