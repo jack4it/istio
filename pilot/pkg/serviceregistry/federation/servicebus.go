@@ -67,6 +67,11 @@ type ServiceBusTransport struct {
 	messageHandler func(msg *SyncMessage)
 	stopCh         chan struct{}
 
+	// stopCtx is cancelled when stopCh closes. Used as the parent context for
+	// all Service Bus operations so that in-flight RPCs are cancelled on shutdown.
+	stopCtx    context.Context
+	stopCancel context.CancelFunc
+
 	// bootstrapDone is closed when the bootstrap drain phase completes and
 	// the transport transitions to steady-state message processing.
 	bootstrapDone chan struct{}
@@ -201,6 +206,17 @@ func NewServiceBusTransport(cfg ServiceBusConfig) (*ServiceBusTransport, error) 
 		batchSize = 100
 	}
 
+	// Create a context that is cancelled when stopCh closes, so all in-flight
+	// Service Bus RPCs (send, receive, peek, ack) are cancelled on shutdown.
+	stopCtx, stopCancel := context.WithCancel(context.Background())
+	go func() {
+		select {
+		case <-cfg.StopCh:
+			stopCancel()
+		case <-stopCtx.Done():
+		}
+	}()
+
 	t := &ServiceBusTransport{
 		client:                client,
 		sender:                sender,
@@ -213,6 +229,8 @@ func NewServiceBusTransport(cfg ServiceBusConfig) (*ServiceBusTransport, error) 
 		bootstrapDrainTimeout: drainTimeout,
 		bootstrapBatchSize:    batchSize,
 		stopCh:                cfg.StopCh,
+		stopCtx:               stopCtx,
+		stopCancel:            stopCancel,
 	}
 
 	// Auto-create per-replica subscription if enabled
@@ -334,7 +352,7 @@ func (t *ServiceBusTransport) peekBootstrapMessages() []*SyncMessage {
 		default:
 		}
 
-		ctx, cancel := context.WithTimeout(context.Background(), t.bootstrapDrainTimeout)
+		ctx, cancel := context.WithTimeout(t.stopCtx, t.bootstrapDrainTimeout)
 		messages, err := bootstrapReceiver.PeekMessages(ctx, t.bootstrapBatchSize, &azservicebus.PeekMessagesOptions{
 			FromSequenceNumber: &fromSeqNum,
 		})
@@ -393,7 +411,7 @@ func (t *ServiceBusTransport) drainRetainedMessages() []*SyncMessage {
 		default:
 		}
 
-		ctx, cancel := context.WithTimeout(context.Background(), t.bootstrapDrainTimeout)
+		ctx, cancel := context.WithTimeout(t.stopCtx, t.bootstrapDrainTimeout)
 		messages, err := t.receiver.ReceiveMessages(ctx, t.bootstrapBatchSize, nil)
 		cancel()
 
@@ -414,7 +432,7 @@ func (t *ServiceBusTransport) drainRetainedMessages() []*SyncMessage {
 			var syncMsg SyncMessage
 			if err := json.Unmarshal(m.Body, &syncMsg); err != nil {
 				sbLog.Warnf("Bootstrap: failed to unmarshal message, dead-lettering: %v", err)
-				dlCtx, dlCancel := context.WithTimeout(context.Background(), 5*time.Second)
+				dlCtx, dlCancel := context.WithTimeout(t.stopCtx, 5*time.Second)
 				if dlErr := t.receiver.DeadLetterMessage(dlCtx, m, nil); dlErr != nil {
 					sbLog.Warnf("Bootstrap: failed to dead-letter message: %v", dlErr)
 				}
@@ -432,7 +450,7 @@ func (t *ServiceBusTransport) drainRetainedMessages() []*SyncMessage {
 
 			allMessages = append(allMessages, &syncMsg)
 
-			ackCtx, ackCancel := context.WithTimeout(context.Background(), 5*time.Second)
+			ackCtx, ackCancel := context.WithTimeout(t.stopCtx, 5*time.Second)
 			if err := t.receiver.CompleteMessage(ackCtx, m, nil); err != nil {
 				sbLog.Warnf("Bootstrap: failed to complete message: %v", err)
 			}
@@ -547,7 +565,7 @@ func (t *ServiceBusTransport) ensureSubscription() error {
 		return fmt.Errorf("admin client required for subscription auto-creation")
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	ctx, cancel := context.WithTimeout(t.stopCtx, 30*time.Second)
 	defer cancel()
 
 	// Check if subscription already exists (pod restart with same name)
@@ -636,7 +654,7 @@ func (t *ServiceBusTransport) sendMessage(msg *SyncMessage) error {
 		},
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	ctx, cancel := context.WithTimeout(t.stopCtx, 10*time.Second)
 	defer cancel()
 
 	if err := t.sender.SendMessage(ctx, sbMsg, nil); err != nil {
@@ -660,7 +678,7 @@ func (t *ServiceBusTransport) receiveLoop() {
 		default:
 		}
 
-		ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+		ctx, cancel := context.WithTimeout(t.stopCtx, 60*time.Second)
 		messages, err := t.receiver.ReceiveMessages(ctx, 10, nil)
 		cancel()
 
@@ -686,7 +704,7 @@ func (t *ServiceBusTransport) processMessage(m *azservicebus.ReceivedMessage) {
 	var syncMsg SyncMessage
 	if err := json.Unmarshal(m.Body, &syncMsg); err != nil {
 		sbLog.Warnf("Failed to unmarshal message (dead-lettering): %v", err)
-		dlCtx, dlCancel := context.WithTimeout(context.Background(), 5*time.Second)
+		dlCtx, dlCancel := context.WithTimeout(t.stopCtx, 5*time.Second)
 		defer dlCancel()
 		if dlErr := t.receiver.DeadLetterMessage(dlCtx, m, nil); dlErr != nil {
 			sbLog.Warnf("Failed to dead-letter message: %v", dlErr)
@@ -708,11 +726,9 @@ func (t *ServiceBusTransport) processMessage(m *azservicebus.ReceivedMessage) {
 	t.messageHandler(&syncMsg)
 
 	// Complete (acknowledge) the message
-	ackCtx, ackCancel := context.WithTimeout(context.Background(), 5*time.Second)
+	ackCtx, ackCancel := context.WithTimeout(t.stopCtx, 5*time.Second)
 	defer ackCancel()
 	if err := t.receiver.CompleteMessage(ackCtx, m, nil); err != nil {
 		sbLog.Warnf("Failed to complete message: %v", err)
 	}
 }
-
-
