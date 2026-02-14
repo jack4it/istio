@@ -15,6 +15,8 @@
 package bootstrap
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
 
 	"istio.io/istio/pilot/pkg/features"
@@ -125,14 +127,20 @@ func (s *Server) initFederationSync(args *PilotArgs, serviceControllers *aggrega
 	// Get local network from feature flag
 	localNetwork := network.ID(features.FederationLocalNetwork)
 
-	// Determine subscription name: <clusterID>-<podName> (unique per replica).
-	// Each replica auto-creates its own subscription with autoDeleteOnIdle=30m.
-	podName := args.PodName
-	if podName == "" {
-		podName = "default"
+	// Determine subscription name: use the pod name directly for easy
+	// identification when inspecting Service Bus subscriptions in the portal.
+	// Pod names include random suffixes (e.g., istiod-7b9f5d8c4-abc12) so
+	// cross-cluster collisions are practically impossible.
+	// Hash-truncate if it exceeds the Service Bus 50-character limit.
+	subscriptionName := args.PodName
+	if subscriptionName == "" {
+		subscriptionName = string(s.clusterID) + "-default"
 	}
-	subscriptionName := string(s.clusterID) + "-" + podName
-	log.Infof("Using per-replica subscription: %s", subscriptionName)
+	if len(subscriptionName) > 48 {
+		h := sha256.Sum256([]byte(subscriptionName))
+		subscriptionName = hex.EncodeToString(h[:])[:48]
+	}
+	log.Infof("Using per-replica subscription: %s (pod: %s)", subscriptionName, args.PodName)
 
 	// Create the Service Bus transport
 	sbTransport, err := federation.NewServiceBusTransport(federation.ServiceBusConfig{
