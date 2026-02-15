@@ -483,8 +483,6 @@ const (
 	ClusterUpdate TriggerReason = "cluster"
 	// TagUpdate occurs when the revision's tags change, and all resources must be recalculated.
 	TagUpdate TriggerReason = "tag"
-	// FederationUpdate describes a push triggered by federation-synced service/workload changes
-	FederationUpdate TriggerReason = "federation"
 )
 
 // Merge two update requests together

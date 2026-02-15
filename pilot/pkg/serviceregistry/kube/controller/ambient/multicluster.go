@@ -344,6 +344,12 @@ func (a *index) buildGlobalCollections(
 		opts,
 	)
 
+	// Index local+remote k8s-watched workloads by service key BEFORE merging federation workloads.
+	// Used by outbound federation (ServiceWithSANs) to avoid re-broadcasting federation SANs.
+	a.localWorkloadsByServiceKey = krt.NewIndex[string, model.WorkloadInfo](GlobalWorkloads, "localService", func(o model.WorkloadInfo) []string {
+		return maps.Keys(o.Workload.Services)
+	})
+
 	// Merge federation workloads into GlobalWorkloads so SplitHorizonServices can
 	// discover their SANs for mTLS identity verification. The coalescedWorkloads
 	// pipeline will log warnings about missing network gateways for federation
