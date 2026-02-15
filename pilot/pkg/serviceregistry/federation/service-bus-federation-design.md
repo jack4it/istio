@@ -46,6 +46,167 @@ Each Istiod:
 
 ## Architecture
 
+### Data Flow Overview
+
+#### Outbound: Local Cluster → Service Bus → Remote Clusters
+
+```
+ ┌─────────────────────────────────────────────────────────────────────┐
+ │  Kubernetes (local cluster)                                        │
+ │  ┌──────────┐  ┌──────────┐  ┌───────────────┐                    │
+ │  │ Services │  │ Pods     │  │ EndpointSlices │                    │
+ │  └────┬─────┘  └────┬─────┘  └──────┬────────┘                    │
+ │       └──────────────┼───────────────┘                             │
+ │                      ▼                                             │
+ │  ┌──────────────────────────────────────────┐                      │
+ │  │  krt Informers + buildGlobalCollections  │                      │
+ │  │  (multicluster.go)                       │                      │
+ │  └────────────────────┬─────────────────────┘                      │
+ │                       ▼                                            │
+ │  ┌──────────────────────────────────────────┐                      │
+ │  │  index.localServices   (pre-federation)  │─ ─ ─ ┐              │
+ │  └────────────────────┬─────────────────────┘       │              │
+ │                       ▼                             │              │
+ │  ┌──────────────────────────────────────────┐       │              │
+ │  │  AllLocalNetworkGlobalServicesWithSANs() │◄ ─ ─ ─┘              │
+ │  │  (federation.go)                         │  localWorkloads      │
+ │  │  • filters Global-scope only             │  → populates SANs    │
+ │  │  • attaches SPIFFE SANs from local wls   │                      │
+ │  └────────────────────┬─────────────────────┘                      │
+ │                       ▼                                            │
+ │  ┌──────────────────────────────────────────┐                      │
+ │  │  RegisterGlobalServiceHandler()          │                      │
+ │  │  (federation.go)                         │                      │
+ │  │  • watches localServices for changes     │                      │
+ │  │  • calls handleServiceUpsert/Delete      │                      │
+ │  └────────────────────┬─────────────────────┘                      │
+ └───────────────────────┼────────────────────────────────────────────┘
+                         ▼
+ ┌──────────────────────────────────────────┐
+ │  SyncProtocol  (sync.go)                │
+ │  ┌────────────────────────────────────┐  │
+ │  │  Leader Election gate              │  │
+ │  │  (only leader publishes)           │  │
+ │  └──────────────┬─────────────────────┘  │
+ │                 ▼                        │
+ │  ┌────────────────────────────────────┐  │
+ │  │  buildFullSyncMessage()            │  │
+ │  │  • periodic snapshots              │  │
+ │  │  processOutgoingDebounced()        │  │
+ │  │  • incremental upsert/delete       │  │
+ │  └──────────────┬─────────────────────┘  │
+ │                 ▼                        │
+ │  ┌────────────────────────────────────┐  │
+ │  │  broadcast() → SyncMessage{       │  │
+ │  │    ClusterID, Version, FullSync,   │  │
+ │  │    Services[], NetworkGateway      │  │
+ │  │  }                                 │  │
+ │  └──────────────┬─────────────────────┘  │
+ └─────────────────┼────────────────────────┘
+                   ▼
+ ┌────────────────────────────────────────────┐
+ │  Azure Service Bus  (Topic)               │
+ │  ┌────────────────────────────────────┐    │
+ │  │  istio-service-sync                │    │
+ │  │  ┌──────────┐ ┌──────────┐        │    │
+ │  │  │ sub: c2  │ │ sub: c3  │ ...    │    │
+ │  │  └──────────┘ └──────────┘        │    │
+ │  └────────────────────────────────────┘    │
+ └────────────────────────────────────────────┘
+```
+
+**Key:** Outbound uses `localServices` (pre-federation-merge) so we never re-broadcast
+federated data back to its origin cluster.
+
+#### Inbound: Service Bus → Local Ambient Index → ztunnel XDS
+
+```
+ ┌────────────────────────────────────────────┐
+ │  Azure Service Bus  (Topic)               │
+ │  ┌────────────────────────────────────┐    │
+ │  │  istio-service-sync                │    │
+ │  │  ┌──────────────────────┐          │    │
+ │  │  │ sub: <local-pod>     │          │    │
+ │  │  │ (per-replica, unique) │          │    │
+ │  │  └──────────┬───────────┘          │    │
+ │  └─────────────┼──────────────────────┘    │
+ └────────────────┼───────────────────────────┘
+                  ▼
+ ┌──────────────────────────────────────────┐
+ │  SyncProtocol  (sync.go)                │
+ │  (ALL replicas — no leader gate)        │
+ │  ┌────────────────────────────────────┐  │
+ │  │  handleIncomingMessage()           │  │
+ │  │  • per-cluster debounce timer      │  │
+ │  │  processIncomingDebounced()        │  │
+ │  └──────────────┬─────────────────────┘  │
+ │                 ▼                        │
+ │  ┌────────────────────────────────────┐  │
+ │  │  federationStore (store.go)        │  │
+ │  │  • handleSyncMessage()             │  │
+ │  │  • per-clusterID state sharding    │  │
+ │  │  • tombstone tracking              │  │
+ │  │  • version vector conflict res.    │  │
+ │  │  ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─  │  │
+ │  │  Transforms wire services into:    │  │
+ │  │  • model.ServiceInfo (+ local VIPs)│  │
+ │  │  • split-horizon WorkloadInfo      │  │
+ │  │  • NetworkGateway WorkloadInfo     │  │
+ │  └──────────────┬─────────────────────┘  │
+ │                 ▼                        │
+ │  ┌────────────────────────────────────┐  │
+ │  │  getFederationState() → flatten    │  │
+ │  │  all clusters into one slice each  │  │
+ │  └──────────────┬─────────────────────┘  │
+ └─────────────────┼────────────────────────┘
+                   ▼
+ ┌─────────────────────────────────────────────────────────────────────┐
+ │  *FederationSource  (federation_source.go)                         │
+ │  ┌─────────────────────────────┐  ┌──────────────────────────────┐ │
+ │  │  StaticCollection<Service>  │  │  StaticCollection<Workload>  │ │
+ │  │  .Reset() / .UpdateObject() │  │  .Reset() / .UpdateObject()  │ │
+ │  └──────────────┬──────────────┘  └──────────────┬───────────────┘ │
+ └─────────────────┼────────────────────────────────┼─────────────────┘
+                   │                                │
+         ┌─────── ▼ ───────┐              ┌─────── ▼ ────────┐
+         │  .Services()    │              │  .Workloads()     │
+         └────────┬────────┘              └────────┬──────────┘
+                  │                                │
+ ┌────────────────┼────────────────────────────────┼──────────────────┐
+ │  buildGlobalCollections  (multicluster.go)      │                  │
+ │                │                                │                  │
+ │       ┌────────▼─────────────────┐    ┌─────────▼───────────────┐  │
+ │       │ JoinCollection           │    │ JoinCollection           │  │
+ │       │ GlobalMerged + FedSvcs   │    │ GlobalWls + FedWls       │  │
+ │       │ → GlobalMergedWith       │    │ → GlobalWithFederation   │  │
+ │       │   FederationServices     │    │   Workloads              │  │
+ │       └────────┬─────────────────┘    └────┬────────────────────┘  │
+ │                │                           │                       │
+ │                ▼                           ├──────────────┐        │
+ │  ┌──────────────────────────┐              │              │        │
+ │  │  SplitHorizonServices   │              ▼              ▼        │
+ │  │  (SAN augmentation sees │    ┌──────────────┐ ┌────────────┐   │
+ │  │   federated workload    │    │ coalesced    │ │ fedWls     │   │
+ │  │   identities now)       │    │ workloads    │ │ (direct)   │   │
+ │  └──────────────────────────┘    └──────┬──────┘ └────┬───────┘   │
+ │                                         │             │           │
+ │                                    ┌────▼─────────────▼──────┐    │
+ │                                    │  SplitHorizonWorkloads  │    │
+ │                                    │  (JoinCollection)       │    │
+ │                                    └────────────┬────────────┘    │
+ │                                                 │                 │
+ └─────────────────────────────────────────────────┼─────────────────┘
+                                                   ▼
+                                    ┌─────────────────────────┐
+                                    │  XDS Push → ztunnel     │
+                                    │  (ADDRESS type updates)  │
+                                    └─────────────────────────┘
+```
+
+**Key:** Federation workloads enter `SplitHorizonWorkloads` via **two paths**: merged into
+`GlobalWorkloads` (for SAN discovery by `SplitHorizonServices`) and directly appended
+(bypassing coalescence, since they already carry gateway routing).
+
 ### Layered Design
 
 The federation system separates concerns into two layers:
@@ -223,10 +384,11 @@ Federation only replaces the **control plane service discovery transport** (how 
 | `pilot/pkg/serviceregistry/federation/tombstone.go` | Service tombstone manager |
 | `pilot/pkg/serviceregistry/federation/version.go` | Version vector tracking |
 | `pilot/pkg/features/ambient.go` | Feature flags |
-| `pilot/pkg/bootstrap/servicecontroller.go` | `initFederationSync` bootstrap wiring |
-| `pilot/pkg/serviceregistry/kube/controller/ambient/federation.go` | KRT collections + ambient index + SAN augmentation |
-| `pilot/pkg/model/service.go` | `FederationAmbientIndex`, `RegisterFederationCollections` |
-| `pilot/pkg/model/push_context.go` | `FederationUpdate` trigger reason |
+| `pilot/pkg/bootstrap/federation.go` | `initFederationSync` bootstrap wiring |
+| `pilot/pkg/serviceregistry/kube/controller/ambient/federation.go` | Ambient index federation methods + SAN augmentation |
+| `pilot/pkg/serviceregistry/kube/controller/ambient/federation_source.go` | `FederationSource` — krt StaticCollection bridge |
+| `pilot/pkg/serviceregistry/kube/controller/ambient/multicluster.go` | `buildGlobalCollections` — merges federation into ambient |
+| `pilot/pkg/model/service.go` | `FederationAmbientIndex` interface |
 
 ### Status
 
