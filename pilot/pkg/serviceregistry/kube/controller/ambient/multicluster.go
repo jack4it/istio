@@ -344,14 +344,17 @@ func (a *index) buildGlobalCollections(
 		opts,
 	)
 
-	// Merge federation workloads into GlobalWorkloads so they participate in
-	// split-horizon coalescing (remote-network workloads get routed via e/w gateway).
+	// Merge federation workloads into GlobalWorkloads so SplitHorizonServices can
+	// discover their SANs for mTLS identity verification. The coalescedWorkloads
+	// pipeline will log warnings about missing network gateways for federation
+	// networks (harmless: federation provides its own split-horizon workloads).
+	var joinedFedWls krt.Collection[model.WorkloadInfo]
 	if len(options.FederationSources) > 0 {
 		fedWlCollections := make([]krt.Collection[model.WorkloadInfo], 0, len(options.FederationSources))
 		for _, fs := range options.FederationSources {
 			fedWlCollections = append(fedWlCollections, fs.Workloads())
 		}
-		joinedFedWls := krt.JoinCollection(fedWlCollections, opts.With(
+		joinedFedWls = krt.JoinCollection(fedWlCollections, opts.With(
 			krt.WithName("FederationWorkloads/Joined"),
 			krt.WithJoinUnchecked(),
 		)...)
@@ -360,13 +363,6 @@ func (a *index) buildGlobalCollections(
 			[]krt.Collection[model.WorkloadInfo]{GlobalWorkloads, joinedFedWls},
 			opts.With(krt.WithName("GlobalWithFederationWorkloads"), krt.WithJoinUnchecked())...,
 		)
-
-		joinedFedWls.RegisterBatch(krt.BatchedEventFilter(
-			func(a model.WorkloadInfo) *workloadapi.Workload {
-				return a.Workload
-			},
-			PushXdsAddress(a.XDSUpdater, model.WorkloadInfo.ResourceName),
-		), false)
 	}
 
 	GlobalWorkloadServiceIndex := krt.NewIndex[string, model.WorkloadInfo](GlobalWorkloads, "service", func(o model.WorkloadInfo) []string {
@@ -449,11 +445,28 @@ func (a *index) buildGlobalCollections(
 		return &wi
 	}, opts.WithName("NetworkLocalWorkloads")...)
 
+	splitHorizonComponents := []krt.Collection[model.WorkloadInfo]{
+		coalescedWorkloads,
+		networkLocalWorkloads,
+	}
+
+	// Merge federation workloads directly into SplitHorizonWorkloads.
+	// The federation store already produces properly formed split-horizon workloads
+	// (with gateway routing, correct UIDs, network gateway entries) so they bypass
+	// the coalescence pipeline which requires k8s-discovered network gateways.
+	if joinedFedWls != nil {
+		splitHorizonComponents = append(splitHorizonComponents, joinedFedWls)
+
+		joinedFedWls.RegisterBatch(krt.BatchedEventFilter(
+			func(a model.WorkloadInfo) *workloadapi.Workload {
+				return a.Workload
+			},
+			PushXdsAddress(a.XDSUpdater, model.WorkloadInfo.ResourceName),
+		), false)
+	}
+
 	SplitHorizonWorkloads := krt.JoinCollection(
-		[]krt.Collection[model.WorkloadInfo]{
-			coalescedWorkloads,
-			networkLocalWorkloads,
-		},
+		splitHorizonComponents,
 		opts.WithName("SplitHorizonWorkloads")...,
 	)
 	SplitHorizonWorkloads.RegisterBatch(krt.BatchedEventFilter(
