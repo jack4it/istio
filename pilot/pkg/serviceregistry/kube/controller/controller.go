@@ -165,9 +165,9 @@ type Options struct {
 
 	KrtDebugger *krt.DebugHandler
 
-	// FederationSources provides external service discovery from federated clusters.
-	// These are created by bootstrap and passed through to ambient.Options.
-	FederationSources []*ambient.FederationSource
+	// FederationSource provides external service discovery from federated clusters.
+	// Created by bootstrap and passed through to ambient.Options.
+	FederationSource *ambient.FederationSource
 }
 
 // kubernetesNode represents a kubernetes node that is reachable externally
@@ -307,17 +307,17 @@ func NewController(kubeClient kubelib.Client, options Options) *Controller {
 
 	if features.EnableAmbient && options.ConfigCluster {
 		c.ambientIndex = ambient.New(ambient.Options{
-			Client:            kubeClient,
-			SystemNamespace:   options.SystemNamespace,
-			DomainSuffix:      options.DomainSuffix,
-			ClusterID:         options.ClusterID,
-			IsConfigCluster:   options.ConfigCluster,
-			Revision:          options.Revision,
-			XDSUpdater:        options.XDSUpdater,
-			MeshConfig:        options.MeshWatcher,
-			StatusNotifier:    options.StatusWritingEnabled,
-			Debugger:          options.KrtDebugger,
-			FederationSources: options.FederationSources,
+			Client:           kubeClient,
+			SystemNamespace:  options.SystemNamespace,
+			DomainSuffix:     options.DomainSuffix,
+			ClusterID:        options.ClusterID,
+			IsConfigCluster:  options.ConfigCluster,
+			Revision:         options.Revision,
+			XDSUpdater:       options.XDSUpdater,
+			MeshConfig:       options.MeshWatcher,
+			StatusNotifier:   options.StatusWritingEnabled,
+			Debugger:         options.KrtDebugger,
+			FederationSource: options.FederationSource,
 			Flags: ambient.FeatureFlags{
 				DefaultAllowFromWaypoint:              features.DefaultAllowFromWaypoint,
 				EnableK8SServiceSelectWorkloadEntries: features.EnableK8SServiceSelectWorkloadEntries,

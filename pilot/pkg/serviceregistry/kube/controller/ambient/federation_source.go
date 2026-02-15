@@ -28,8 +28,6 @@ import (
 // mutations trigger downstream recomputation of indexes, RegisterBatch
 // handlers, and XDS pushes automatically.
 type FederationSource struct {
-	clusterID cluster.ID
-
 	services  krt.StaticCollection[model.ServiceInfo]
 	workloads krt.StaticCollection[model.WorkloadInfo]
 }
@@ -48,15 +46,9 @@ func NewFederationSource(clusterID cluster.ID, stopCh <-chan struct{}) *Federati
 		krt.WithStop(stopCh),
 	)
 	return &FederationSource{
-		clusterID: clusterID,
 		services:  services,
 		workloads: workloads,
 	}
-}
-
-// ClusterID returns the remote cluster identity for this source.
-func (f *FederationSource) ClusterID() cluster.ID {
-	return f.clusterID
 }
 
 // Services returns the service collection for merging into the ambient index.

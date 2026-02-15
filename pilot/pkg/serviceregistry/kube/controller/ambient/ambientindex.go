@@ -172,10 +172,9 @@ type Options struct {
 	ClientBuilder               multicluster.ClientBuilder
 	RemoteClientConfigOverrides []func(*rest.Config)
 
-	// FederationSources provides external service discovery from federated clusters.
-	// Each source represents one remote cluster whose services/workloads are merged
-	// into the ambient index via krt.JoinCollection.
-	FederationSources []*FederationSource
+	// FederationSource provides external service discovery from federated clusters.
+	// Services and workloads are merged into the ambient index via krt.JoinCollection.
+	FederationSource *FederationSource
 }
 
 func New(options Options) Index {

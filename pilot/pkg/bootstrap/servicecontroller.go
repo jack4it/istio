@@ -47,7 +47,7 @@ func (s *Server) initServiceControllers(args *PilotArgs) error {
 	var fedSource *ambient.FederationSource
 	if features.EnableFederation {
 		fedSource = ambient.NewFederationSource(s.clusterID, s.internalStop)
-		args.RegistryOptions.KubeOptions.FederationSources = []*ambient.FederationSource{fedSource}
+		args.RegistryOptions.KubeOptions.FederationSource = fedSource
 	}
 
 	registered := sets.New[provider.ID]()

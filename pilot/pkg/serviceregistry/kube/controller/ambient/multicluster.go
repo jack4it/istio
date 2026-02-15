@@ -279,24 +279,17 @@ func (a *index) buildGlobalCollections(
 	// Federation services represent services discovered from remote clusters via Service Bus.
 	// They must be merged here (before SplitHorizonServices) so that SAN augmentation
 	// picks up federation workloads from different networks.
-	if len(options.FederationSources) > 0 {
-		fedSvcCollections := make([]krt.Collection[model.ServiceInfo], 0, len(options.FederationSources))
-		for _, fs := range options.FederationSources {
-			fedSvcCollections = append(fedSvcCollections, fs.Services())
-		}
-		joinedFedSvcs := krt.JoinCollection(fedSvcCollections, opts.With(
-			krt.WithName("FederationServices/Joined"),
-			krt.WithJoinUnchecked(),
-		)...)
-		a.federationServices = joinedFedSvcs
+	if options.FederationSource != nil {
+		fedSvcs := options.FederationSource.Services()
+		a.federationServices = fedSvcs
 
 		// Merge global + federation services. Global wins on key conflict.
 		GlobalMergedWorkloadServices = krt.JoinCollection(
-			[]krt.Collection[model.ServiceInfo]{GlobalMergedWorkloadServices, joinedFedSvcs},
+			[]krt.Collection[model.ServiceInfo]{GlobalMergedWorkloadServices, fedSvcs},
 			opts.WithName("GlobalMergedWithFederationServices")...,
 		)
 
-		joinedFedSvcs.RegisterBatch(krt.BatchedEventFilter(
+		fedSvcs.RegisterBatch(krt.BatchedEventFilter(
 			func(a model.ServiceInfo) *workloadapi.Service {
 				return a.Service
 			},
@@ -354,19 +347,12 @@ func (a *index) buildGlobalCollections(
 	// discover their SANs for mTLS identity verification. The coalescedWorkloads
 	// pipeline will log warnings about missing network gateways for federation
 	// networks (harmless: federation provides its own split-horizon workloads).
-	var joinedFedWls krt.Collection[model.WorkloadInfo]
-	if len(options.FederationSources) > 0 {
-		fedWlCollections := make([]krt.Collection[model.WorkloadInfo], 0, len(options.FederationSources))
-		for _, fs := range options.FederationSources {
-			fedWlCollections = append(fedWlCollections, fs.Workloads())
-		}
-		joinedFedWls = krt.JoinCollection(fedWlCollections, opts.With(
-			krt.WithName("FederationWorkloads/Joined"),
-			krt.WithJoinUnchecked(),
-		)...)
+	var fedWls krt.Collection[model.WorkloadInfo]
+	if options.FederationSource != nil {
+		fedWls = options.FederationSource.Workloads()
 
 		GlobalWorkloads = krt.JoinCollection(
-			[]krt.Collection[model.WorkloadInfo]{GlobalWorkloads, joinedFedWls},
+			[]krt.Collection[model.WorkloadInfo]{GlobalWorkloads, fedWls},
 			opts.With(krt.WithName("GlobalWithFederationWorkloads"), krt.WithJoinUnchecked())...,
 		)
 	}
@@ -460,10 +446,10 @@ func (a *index) buildGlobalCollections(
 	// The federation store already produces properly formed split-horizon workloads
 	// (with gateway routing, correct UIDs, network gateway entries) so they bypass
 	// the coalescence pipeline which requires k8s-discovered network gateways.
-	if joinedFedWls != nil {
-		splitHorizonComponents = append(splitHorizonComponents, joinedFedWls)
+	if fedWls != nil {
+		splitHorizonComponents = append(splitHorizonComponents, fedWls)
 
-		joinedFedWls.RegisterBatch(krt.BatchedEventFilter(
+		fedWls.RegisterBatch(krt.BatchedEventFilter(
 			func(a model.WorkloadInfo) *workloadapi.Workload {
 				return a.Workload
 			},
