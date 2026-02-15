@@ -942,12 +942,13 @@ type ServiceDiscovery interface {
 type GlobalServiceHandler func(prev, curr *ServiceInfo, event Event)
 
 // FederationAmbientIndex is the interface for federation integration with the ambient index.
-// It combines collection registration with service access for the federation sync protocol.
-// Note: The collection parameters use any to avoid import cycles with krt package.
-// Implementations should accept krt.StaticCollection[ServiceInfo] and krt.StaticCollection[WorkloadInfo].
+// It provides access to local service data needed by the federation sync protocol
+// for outbound broadcasting to remote clusters.
+//
+// Federation inbound data (remote services/workloads from Service Bus) is integrated
+// via FederationSources passed to ambient.Options at construction time, rather than
+// through late-binding registration. This enables clean krt collection merging.
 type FederationAmbientIndex interface {
-	// RegisterFederationCollections registers federation service/workload collections with the ambient index.
-	RegisterFederationCollections(services, workloads any)
 	// AllLocalNetworkGlobalServicesWithSANs returns global services with SubjectAltNames populated
 	// based on local workloads. This is used for federation sync so remote clusters know what
 	// identities to expect when connecting to workloads behind these services.
@@ -955,7 +956,8 @@ type FederationAmbientIndex interface {
 	// ServiceWithSANs returns a copy of the service with SubjectAltNames populated
 	// based on local workloads backing it.
 	ServiceWithSANs(svc *ServiceInfo) *ServiceInfo
-	// RegisterGlobalServiceHandler registers a callback for global service changes.
+	// RegisterGlobalServiceHandler registers a callback for local global service changes.
+	// Only fires for services originating from this cluster, not federation data.
 	RegisterGlobalServiceHandler(f GlobalServiceHandler)
 }
 

@@ -205,6 +205,10 @@ func (a *index) buildGlobalCollections(
 		opts,
 		false, // Don't precompute here; these will just get merged into the global collection later
 	)
+	// Store the local-only services collection for outbound federation sync.
+	// This prevents federation data from being re-broadcast.
+	a.localServices = LocalWorkloadServices
+
 	// All of this is local only, but we need to do it here so we don't have to rebuild collections in ambientindex
 	if features.EnableAmbientStatus {
 		serviceEntriesWriter := kclient.NewWriteClient[*networkingclient.ServiceEntry](options.Client)
@@ -271,6 +275,35 @@ func (a *index) buildGlobalCollections(
 		opts.WithName("GlobalMergedServiceInfos")...,
 	)
 
+	// Merge federation services into the global merged services.
+	// Federation services represent services discovered from remote clusters via Service Bus.
+	// They must be merged here (before SplitHorizonServices) so that SAN augmentation
+	// picks up federation workloads from different networks.
+	if len(options.FederationSources) > 0 {
+		fedSvcCollections := make([]krt.Collection[model.ServiceInfo], 0, len(options.FederationSources))
+		for _, fs := range options.FederationSources {
+			fedSvcCollections = append(fedSvcCollections, fs.Services())
+		}
+		joinedFedSvcs := krt.JoinCollection(fedSvcCollections, opts.With(
+			krt.WithName("FederationServices/Joined"),
+			krt.WithJoinUnchecked(),
+		)...)
+		a.federationServices = joinedFedSvcs
+
+		// Merge global + federation services. Global wins on key conflict.
+		GlobalMergedWorkloadServices = krt.JoinCollection(
+			[]krt.Collection[model.ServiceInfo]{GlobalMergedWorkloadServices, joinedFedSvcs},
+			opts.WithName("GlobalMergedWithFederationServices")...,
+		)
+
+		joinedFedSvcs.RegisterBatch(krt.BatchedEventFilter(
+			func(a model.ServiceInfo) *workloadapi.Service {
+				return a.Service
+			},
+			PushXdsAddress(a.XDSUpdater, model.ServiceInfo.ResourceName),
+		), false)
+	}
+
 	GobalWorkloadServicesWithClusterByCluster := nestedCollectionIndexByCluster(GlobalWorkloadServicesWithCluster)
 
 	LocalNamespacesInfo := krt.NewCollection(LocalNamespaces, func(ctx krt.HandlerContext, ns *v1.Namespace) *model.NamespaceInfo {
@@ -310,6 +343,31 @@ func (a *index) buildGlobalCollections(
 		options.DomainSuffix,
 		opts,
 	)
+
+	// Merge federation workloads into GlobalWorkloads so they participate in
+	// split-horizon coalescing (remote-network workloads get routed via e/w gateway).
+	if len(options.FederationSources) > 0 {
+		fedWlCollections := make([]krt.Collection[model.WorkloadInfo], 0, len(options.FederationSources))
+		for _, fs := range options.FederationSources {
+			fedWlCollections = append(fedWlCollections, fs.Workloads())
+		}
+		joinedFedWls := krt.JoinCollection(fedWlCollections, opts.With(
+			krt.WithName("FederationWorkloads/Joined"),
+			krt.WithJoinUnchecked(),
+		)...)
+
+		GlobalWorkloads = krt.JoinCollection(
+			[]krt.Collection[model.WorkloadInfo]{GlobalWorkloads, joinedFedWls},
+			opts.With(krt.WithName("GlobalWithFederationWorkloads"), krt.WithJoinUnchecked())...,
+		)
+
+		joinedFedWls.RegisterBatch(krt.BatchedEventFilter(
+			func(a model.WorkloadInfo) *workloadapi.Workload {
+				return a.Workload
+			},
+			PushXdsAddress(a.XDSUpdater, model.WorkloadInfo.ResourceName),
+		), false)
+	}
 
 	GlobalWorkloadServiceIndex := krt.NewIndex[string, model.WorkloadInfo](GlobalWorkloads, "service", func(o model.WorkloadInfo) []string {
 		return maps.Keys(o.Workload.Services)

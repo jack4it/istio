@@ -66,16 +66,15 @@ type SyncProtocol struct {
 	ambientIndex model.FederationAmbientIndex
 
 	// federationServices holds federated remote services for ambient index integration.
+	// These are provided externally (owned by FederationSource) and shared with the ambient index.
 	federationServices krt.StaticCollection[model.ServiceInfo]
 
 	// federationWorkloads holds federated remote workloads for ambient index integration.
+	// These are provided externally (owned by FederationSource) and shared with the ambient index.
 	federationWorkloads krt.StaticCollection[model.WorkloadInfo]
 
 	// localNetworkGatewayGetter returns the local network gateway.
 	localNetworkGatewayGetter func() *model.NetworkGateway
-
-	// xdsUpdater triggers XDS pushes when federation collections change.
-	xdsUpdater model.XDSUpdater
 
 	// snapshotInterval controls how often a full-sync snapshot is published.
 	snapshotInterval time.Duration
@@ -128,9 +127,15 @@ type SyncProtocolConfig struct {
 	// This is synced to remote clusters so they can route traffic back.
 	LocalNetworkGatewayGetter func() *model.NetworkGateway
 
-	// XDSUpdater triggers XDS pushes when federation collections change.
-	// This is required to notify ztunnel about new services/workloads.
-	XDSUpdater model.XDSUpdater
+	// FederationServices is the StaticCollection for federated services.
+	// Owned by FederationSource and shared with the ambient index via Options.
+	// sync.go calls Reset() when inbound messages arrive; the ambient index
+	// observes changes via krt's reactive pipeline.
+	FederationServices krt.StaticCollection[model.ServiceInfo]
+
+	// FederationWorkloads is the StaticCollection for federated workloads.
+	// Same ownership model as FederationServices.
+	FederationWorkloads krt.StaticCollection[model.WorkloadInfo]
 
 	// TrustDomainGetter returns the mesh trust domain.
 	// Used to set the trust domain on split-horizon workloads for HBONE mTLS.
@@ -173,20 +178,10 @@ func NewSyncProtocol(cfg SyncProtocolConfig) (*SyncProtocol, error) {
 		StopCh:             cfg.StopCh,
 	})
 
-	// Create KRT StaticCollections for federation services and workloads.
-	// These will be registered with the ambient index for lookup integration.
-	federationServices := krt.NewStaticCollection[model.ServiceInfo](
-		nil, // synced - will be set when initial sync completes
-		nil, // initial values
-		krt.WithName("FederationServices"),
-		krt.WithStop(cfg.StopCh),
-	)
-	federationWorkloads := krt.NewStaticCollection[model.WorkloadInfo](
-		nil, // synced
-		nil, // initial values
-		krt.WithName("FederationWorkloads"),
-		krt.WithStop(cfg.StopCh),
-	)
+	// Use externally provided federation collections (owned by FederationSource).
+	// These are already wired into the ambient index via Options.FederationSources.
+	federationServices := cfg.FederationServices
+	federationWorkloads := cfg.FederationWorkloads
 
 	snapshotInterval := cfg.SnapshotInterval
 	if snapshotInterval == 0 {
@@ -202,7 +197,6 @@ func NewSyncProtocol(cfg SyncProtocolConfig) (*SyncProtocol, error) {
 		federationServices:        federationServices,
 		federationWorkloads:       federationWorkloads,
 		localNetworkGatewayGetter: cfg.LocalNetworkGatewayGetter,
-		xdsUpdater:                cfg.XDSUpdater,
 		snapshotInterval:          snapshotInterval,
 		incomingCh:                make(chan *SyncMessage, 100),
 		outgoingCh:                make(chan outgoingEvent, 100),
@@ -249,11 +243,7 @@ func (sp *SyncProtocol) Start() error {
 	}
 
 	if sp.ambientIndex != nil {
-		// 3. Register federation collections with ambient index
-		sp.ambientIndex.RegisterFederationCollections(sp.federationServices, sp.federationWorkloads)
-		syncLog.Info("Registered federation collections with ambient index")
-
-		// 4. Register for push-based global service change events.
+		// 3. Register for push-based global service change events.
 		// Events are enqueued to outgoingCh on all replicas but only
 		// broadcast by processOutgoingDebounced when isLeader is true.
 		sp.ambientIndex.RegisterGlobalServiceHandler(func(prev, curr *model.ServiceInfo, event model.Event) {
@@ -608,13 +598,9 @@ func (sp *SyncProtocol) processIncomingDebounced() {
 		services, workloads := sp.store.getFederationState()
 		sp.federationServices.Reset(services)
 		sp.federationWorkloads.Reset(workloads)
-
-		if sp.xdsUpdater != nil {
-			sp.xdsUpdater.ConfigUpdate(&model.PushRequest{
-				Full:   true,
-				Reason: model.NewReasonStats(model.FederationUpdate),
-			})
-		}
+		// No manual XDS push needed: krt's reactive pipeline propagates
+		// collection changes through JoinCollection → indexes → RegisterBatch
+		// → XDS push automatically.
 
 		syncLog.Infof("Flushed debounced federation update: %d messages, %d services, %d workloads",
 			count, len(services), len(workloads))

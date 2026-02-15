@@ -25,6 +25,7 @@ import (
 	"istio.io/istio/pilot/pkg/serviceregistry/aggregate"
 	"istio.io/istio/pilot/pkg/serviceregistry/federation"
 	kubecontroller "istio.io/istio/pilot/pkg/serviceregistry/kube/controller"
+	"istio.io/istio/pilot/pkg/serviceregistry/kube/controller/ambient"
 	"istio.io/istio/pilot/pkg/serviceregistry/provider"
 	"istio.io/istio/pilot/pkg/serviceregistry/serviceentry"
 	"istio.io/istio/pkg/log"
@@ -46,6 +47,14 @@ func (s *Server) initServiceControllers(args *PilotArgs) error {
 		serviceentry.WithClusterID(s.clusterID),
 	)
 	serviceControllers.AddRegistry(s.serviceEntryController)
+
+	// Create FederationSource before kube registry so it's available for ambient.Options.
+	// The FederationSource owns the StaticCollections that bridge sync.go ↔ ambient index.
+	var fedSource *ambient.FederationSource
+	if features.EnableFederation {
+		fedSource = ambient.NewFederationSource(s.clusterID, s.internalStop)
+		args.RegistryOptions.KubeOptions.FederationSources = []*ambient.FederationSource{fedSource}
+	}
 
 	registered := sets.New[provider.ID]()
 	for _, r := range args.RegistryOptions.Registries {
@@ -69,7 +78,7 @@ func (s *Server) initServiceControllers(args *PilotArgs) error {
 	// Initialize federation if enabled.
 	// Must be done before serviceControllers.Run so the sync protocol gets started.
 	if features.EnableFederation {
-		if err := s.initFederationSync(args, serviceControllers); err != nil {
+		if err := s.initFederationSync(args, serviceControllers, fedSource); err != nil {
 			return err
 		}
 	}
@@ -119,7 +128,7 @@ func (s *Server) initKubeRegistry(args *PilotArgs) (err error) {
 //     and service change events to Service Bus. All replicas process inbound messages.
 //   - Version vectors use max(counter+1, time.Now().UnixMilli()) to ensure a new
 //     leader always produces versions higher than the previous leader.
-func (s *Server) initFederationSync(args *PilotArgs, serviceControllers *aggregate.Controller) error {
+func (s *Server) initFederationSync(args *PilotArgs, serviceControllers *aggregate.Controller, fedSource *ambient.FederationSource) error {
 	log.Info("Initializing Service Bus federation")
 
 	stopCh := make(chan struct{})
@@ -157,7 +166,8 @@ func (s *Server) initFederationSync(args *PilotArgs, serviceControllers *aggrega
 		return fmt.Errorf("failed to create Service Bus transport: %w", err)
 	}
 
-	// Create sync protocol with the Service Bus transport injected
+	// Create sync protocol with the Service Bus transport injected.
+	// Federation collections are owned by FederationSource and shared with the ambient index.
 	syncProtocol, err := federation.NewSyncProtocol(federation.SyncProtocolConfig{
 		LocalClusterID: s.clusterID,
 		AmbientIndexGetter: func() model.FederationAmbientIndex {
@@ -175,10 +185,11 @@ func (s *Server) initFederationSync(args *PilotArgs, serviceControllers *aggrega
 		TrustDomainGetter: func() string {
 			return s.environment.Mesh().GetTrustDomain()
 		},
-		XDSUpdater:       s.XDSServer,
-		SnapshotInterval: features.ServiceBusSnapshotInterval,
-		Transport:        sbTransport,
-		StopCh:           stopCh,
+		FederationServices:  fedSource.StaticServices(),
+		FederationWorkloads: fedSource.StaticWorkloads(),
+		SnapshotInterval:    features.ServiceBusSnapshotInterval,
+		Transport:           sbTransport,
+		StopCh:              stopCh,
 	})
 	if err != nil {
 		return fmt.Errorf("failed to create sync protocol: %w", err)

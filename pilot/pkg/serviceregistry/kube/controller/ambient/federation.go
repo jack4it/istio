@@ -22,144 +22,19 @@ import (
 	"istio.io/istio/pkg/spiffe"
 	"istio.io/istio/pkg/util/protomarshal"
 	"istio.io/istio/pkg/util/sets"
-	"istio.io/istio/pkg/workloadapi"
 )
-
-// federationIndex encapsulates federation-synced services and workloads state.
-// These are populated by the federation sync protocol when enabled.
-type federationIndex struct {
-	services   krt.StaticCollection[model.ServiceInfo]
-	workloads  krt.StaticCollection[model.WorkloadInfo]
-	registered bool
-}
-
-// lookupFederation checks federation collections for services and workloads.
-func (a *index) lookupFederation(key string) []model.AddressInfo {
-	if !a.federation.registered {
-		return nil
-	}
-
-	// Try service lookup by key (namespace/hostname)
-	if svc := a.federation.services.GetKey(key); svc != nil {
-		res := []model.AddressInfo{svc.AsAddress}
-		// Also get workloads for this service
-		res = append(res, a.lookupFederationWorkloadsForService(svc.ResourceName())...)
-		return res
-	}
-
-	return nil
-}
-
-// lookupFederationWorkloadsForService returns federation workloads that serve the given service.
-func (a *index) lookupFederationWorkloadsForService(serviceKey string) []model.AddressInfo {
-	if !a.federation.registered {
-		return nil
-	}
-
-	var res []model.AddressInfo
-	for _, w := range a.federation.workloads.List() {
-		// Check if this workload serves the requested service
-		if _, ok := w.Workload.Services[serviceKey]; ok {
-			res = append(res, w.AsAddress)
-		}
-	}
-	return res
-}
-
-// lookupFederationWorkloadByKey returns a federation workload by its key (UID).
-func (a *index) lookupFederationWorkloadByKey(key string) *model.WorkloadInfo {
-	if !a.federation.registered {
-		return nil
-	}
-	return a.federation.workloads.GetKey(key)
-}
-
-// lookupFederationServiceByKey returns a federation service by its key (namespace/hostname).
-func (a *index) lookupFederationServiceByKey(key string) *model.ServiceInfo {
-	if !a.federation.registered {
-		return nil
-	}
-	return a.federation.services.GetKey(key)
-}
-
-// lookupFederationServiceByAddress returns a federation service by network/ip address.
-func (a *index) lookupFederationServiceByAddress(network, ip string) *model.ServiceInfo {
-	if !a.federation.registered {
-		return nil
-	}
-	for _, gs := range a.federation.services.List() {
-		for _, addr := range gs.Service.Addresses {
-			if addr.Network == network && string(addr.Address) == ip {
-				return &gs
-			}
-		}
-	}
-	return nil
-}
-
-// allFederationAddresses returns all federation-synced services and workloads as AddressInfo.
-// It accepts an optional set of local service keys to skip federation services that overlap
-// with local services (their SANs should be merged into the local service instead).
-func (a *index) allFederationAddresses(localServiceKeys sets.String) []model.AddressInfo {
-	if !a.federation.registered {
-		return nil
-	}
-
-	var res []model.AddressInfo
-	for _, s := range a.federation.services.List() {
-		// Skip federation services that overlap with local services.
-		// Their SANs are merged into the local service by augmentServiceWithFederationSANs.
-		if localServiceKeys.Contains(s.ResourceName()) {
-			continue
-		}
-		res = append(res, s.AsAddress)
-	}
-	for _, wl := range a.federation.workloads.List() {
-		res = append(res, wl.AsAddress)
-	}
-	return res
-}
-
-// augmentServiceWithFederationSANs checks if a federation service with the same key exists
-// and, if so, merges its SubjectAltNames into a copy of the local service.
-// This is needed because when ztunnel routes cross-network traffic via double HBONE,
-// it uses the service's SubjectAltNames as final_sans for inner tunnel TLS verification.
-// Without this, local services with remote (federation) endpoints would have empty SANs
-// and ztunnel's identity verification would fail.
-func (a *index) augmentServiceWithFederationSANs(svc *model.ServiceInfo) model.AddressInfo {
-	if !a.federation.registered {
-		return svc.AsAddress
-	}
-
-	// Check if there's a federation service with the same key that has SANs
-	fedSvc := a.federation.services.GetKey(svc.ResourceName())
-	if fedSvc == nil || len(fedSvc.Service.SubjectAltNames) == 0 {
-		return svc.AsAddress
-	}
-
-	// Merge federation SANs into a copy of the local service
-	mergedSANs := sets.New(svc.Service.SubjectAltNames...)
-	mergedSANs.InsertAll(fedSvc.Service.SubjectAltNames...)
-
-	newSvcInfo := model.ServiceInfo{
-		Service:      protomarshal.Clone(svc.Service),
-		Scope:        svc.Scope,
-		CreationTime: svc.CreationTime,
-	}
-	newSvcInfo.Service.SubjectAltNames = sets.SortedList(mergedSANs)
-	augmented := precomputeService(newSvcInfo)
-
-	log.Debugf("Augmented local service %s with federation SANs: %v", svc.Service.Hostname, augmented.Service.SubjectAltNames)
-
-	return augmented.AsAddress
-}
 
 // AllLocalNetworkGlobalServicesWithSANs returns all known globally scoped services with
 // SubjectAltNames populated based on the local workloads backing them. This is used for
 // federation sync so remote clusters know what identities to expect when connecting.
+// It uses localServices (pre-merge) to avoid including federated services.
 func (a *index) AllLocalNetworkGlobalServicesWithSANs() []model.ServiceInfo {
 	// Use empty WaypointKey for federation context - network is only used for debug logging
-	services := a.AllLocalNetworkGlobalServices(model.WaypointKey{})
+	svcCollection := a.localServices
+	if svcCollection == nil {
+		svcCollection = a.services.Collection
+	}
+	services := a.allLocalNetworkGlobalServicesFromCollection(svcCollection)
 
 	// Get mesh config for trust domain
 	meshCfg := a.meshConfig.Get()
@@ -170,9 +45,14 @@ func (a *index) AllLocalNetworkGlobalServicesWithSANs() []model.ServiceInfo {
 
 	result := make([]model.ServiceInfo, 0, len(services))
 	for _, svc := range services {
-		// Look up workloads backing this service
+		// Look up local workloads backing this service
 		svcKey := svc.Service.Namespace + "/" + svc.Service.Hostname
-		wls := a.workloads.ByServiceKey.Lookup(svcKey)
+		var wls []model.WorkloadInfo
+		if a.localWorkloadsByServiceKey != nil {
+			wls = a.localWorkloadsByServiceKey.Lookup(svcKey)
+		} else {
+			wls = a.workloads.ByServiceKey.Lookup(svcKey)
+		}
 
 		if len(wls) == 0 {
 			// No workloads, return service as-is
@@ -210,8 +90,37 @@ func (a *index) AllLocalNetworkGlobalServicesWithSANs() []model.ServiceInfo {
 	return result
 }
 
+// allLocalNetworkGlobalServicesFromCollection returns global-scoped services from the given
+// collection. This is factored out from AllLocalNetworkGlobalServices so that the outbound
+// federation path can operate on localServices (pre-merge) without including federated data.
+func (a *index) allLocalNetworkGlobalServicesFromCollection(col krt.Collection[model.ServiceInfo]) []model.ServiceInfo {
+	var res []model.ServiceInfo
+	for _, svc := range col.List() {
+		if svc.Scope != model.Global {
+			// Check if the service is a waypoint containing global services
+			wpSvcs := a.services.ByOwningWaypointHostname.Lookup(NamespaceHostname{
+				Namespace: svc.Service.Namespace,
+				Hostname:  svc.Service.Hostname,
+			})
+			if len(wpSvcs) == 0 {
+				continue
+			}
+			for _, resp := range wpSvcs {
+				if resp.Scope == model.Global {
+					res = append(res, svc)
+					break
+				}
+			}
+		} else {
+			res = append(res, svc)
+		}
+	}
+	return res
+}
+
 // ServiceWithSANs returns a copy of the service with SubjectAltNames populated
-// based on local workloads backing it.
+// based on local workloads backing it. Uses localWorkloadsByServiceKey to avoid
+// including federation workloads in the SAN computation.
 func (a *index) ServiceWithSANs(svc *model.ServiceInfo) *model.ServiceInfo {
 	if svc == nil || svc.Service == nil {
 		return svc
@@ -223,9 +132,14 @@ func (a *index) ServiceWithSANs(svc *model.ServiceInfo) *model.ServiceInfo {
 		return svc
 	}
 
-	// Look up workloads backing this service
+	// Look up local workloads backing this service
 	svcKey := svc.Service.Namespace + "/" + svc.Service.Hostname
-	wls := a.workloads.ByServiceKey.Lookup(svcKey)
+	var wls []model.WorkloadInfo
+	if a.localWorkloadsByServiceKey != nil {
+		wls = a.localWorkloadsByServiceKey.Lookup(svcKey)
+	} else {
+		wls = a.workloads.ByServiceKey.Lookup(svcKey)
+	}
 
 	if len(wls) == 0 {
 		return svc
@@ -257,9 +171,14 @@ func (a *index) ServiceWithSANs(svc *model.ServiceInfo) *model.ServiceInfo {
 }
 
 // RegisterGlobalServiceHandler registers a callback that is invoked when
-// global-scoped services change. This uses KRT's push-based event system.
+// local global-scoped services change. Uses localServices (pre-merge) so that
+// federation data changes don't trigger outbound sync loops.
 func (a *index) RegisterGlobalServiceHandler(f model.GlobalServiceHandler) {
-	a.services.Register(func(e krt.Event[model.ServiceInfo]) {
+	svcCollection := a.localServices
+	if svcCollection == nil {
+		svcCollection = a.services.Collection
+	}
+	svcCollection.Register(func(e krt.Event[model.ServiceInfo]) {
 		svc := e.Latest()
 		// Only notify for global scope services
 		if svc.Scope != model.Global {
@@ -284,35 +203,4 @@ func (a *index) RegisterGlobalServiceHandler(f model.GlobalServiceHandler) {
 
 		f(prev, curr, event)
 	})
-}
-
-// RegisterFederationCollections registers external collections for federation-synced services and workloads.
-// This allows federation-synced remote services to be included in the ambient index's Lookup results.
-// The parameters are typed as any to satisfy model.FederationAmbientIndex interface (avoiding import cycles).
-func (a *index) RegisterFederationCollections(services, workloads any) {
-	svcCol := services.(krt.StaticCollection[model.ServiceInfo])
-	wlCol := workloads.(krt.StaticCollection[model.WorkloadInfo])
-
-	a.federation.services = svcCol
-	a.federation.workloads = wlCol
-	a.federation.registered = true
-
-	// Register event handlers to trigger XDS pushes when federation data changes
-	if a.XDSUpdater != nil {
-		svcCol.RegisterBatch(krt.BatchedEventFilter(
-			func(s model.ServiceInfo) *workloadapi.Service {
-				return s.Service
-			},
-			PushXdsAddress(a.XDSUpdater, model.ServiceInfo.ResourceName),
-		), false)
-
-		wlCol.RegisterBatch(krt.BatchedEventFilter(
-			func(w model.WorkloadInfo) *workloadapi.Workload {
-				return w.Workload
-			},
-			PushXdsAddress(a.XDSUpdater, model.WorkloadInfo.ResourceName),
-		), false)
-	}
-
-	log.Infof("Registered federation collections with ambient index")
 }
