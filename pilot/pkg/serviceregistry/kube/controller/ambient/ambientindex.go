@@ -143,9 +143,6 @@ type index struct {
 
 	// localWorkloadsByServiceKey indexes local-only workloads by service key.
 	localWorkloadsByServiceKey krt.Index[string, model.WorkloadInfo]
-
-	// federationServices holds joined federation services across all sources.
-	federationServices krt.Collection[model.ServiceInfo]
 }
 
 type FeatureFlags struct {

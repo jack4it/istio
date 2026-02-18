@@ -281,7 +281,6 @@ func (a *index) buildGlobalCollections(
 	// picks up federation workloads from different networks.
 	if options.FederationSource != nil {
 		fedSvcs := options.FederationSource.Services()
-		a.federationServices = fedSvcs
 
 		// Merge global + federation services. Global wins on key conflict.
 		GlobalMergedWorkloadServices = krt.JoinCollection(
