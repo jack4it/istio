@@ -266,10 +266,15 @@ func deployWorkloadsOrFail(t framework.TestContext, workloads []workload) echo.I
 
 	for _, w := range workloads {
 		if w.replicas != 1 {
-			scaleDeploymentOrFail(t, w.cluster, w.namespace.Name(), fmt.Sprintf("%s-%s", w.serviceName, w.serviceName), w.replicas)
+			if t.Settings().Compatibility {
+				for rev := range t.Settings().Revisions {
+					scaleDeploymentOrFail(t, w.cluster, w.namespace.Name(), fmt.Sprintf("%s-%s-%s", w.serviceName, w.serviceName, rev), w.replicas)
+				}
+			} else {
+				scaleDeploymentOrFail(t, w.cluster, w.namespace.Name(), fmt.Sprintf("%s-%s", w.serviceName, w.serviceName), w.replicas)
+			}
 		}
 	}
-
 	return deployments
 }
 
@@ -305,13 +310,9 @@ func scaleDeploymentOrFail(t framework.TestContext, c cluster.Cluster, namespace
 		if err != nil {
 			return fmt.Errorf("failed to find deployment %s in namespace %s: %w", name, namespace, err)
 		}
-		pods, err := c.PodsForSelector(t.Context(), namespace, s.Status.Selector)
-		if err != nil {
-			return fmt.Errorf("failed to query pods matching selector %s in namespace %s: %w", s.Status.Selector, namespace, err)
-		}
-		if s.Status.Replicas == scale && len(pods.Items) == int(scale) {
+		if s.Status.Replicas == scale {
 			return nil
 		}
-		return fmt.Errorf("deployment still has different number of pods, want %d, got %d", scale, len(pods.Items))
+		return fmt.Errorf("deployment %s still has different number of replicas, want %d, got %d", name, scale, s.Status.Replicas)
 	})
 }
