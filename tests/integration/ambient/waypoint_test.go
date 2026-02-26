@@ -817,6 +817,10 @@ spec:
 
 func TestIngressToWaypoint(t *testing.T) {
 	framework.NewTest(t).Run(func(t framework.TestContext) {
+		istioCfg := istio.DefaultConfigOrFail(t, t)
+		ingressGatewayNs := istioCfg.IngressGatewayServiceNamespace
+		ingressGatewayIstioLabel := istioCfg.IngressGatewayIstioLabel
+
 		// Apply a deny-all waypoint policy. This allows us to test the traffic traverses the waypoint
 		t.ConfigIstio().Eval(apps.Namespace.Name(), map[string]string{
 			"Waypoint": apps.ServiceAddressedWaypoint.Config().ServiceWaypointProxy,
@@ -874,15 +878,17 @@ spec:
 			if t.Settings().AmbientMultiNetwork {
 				t.Skip("https://github.com/istio/istio/issues/54245")
 			}
-			t.ConfigIstio().Eval(apps.Namespace.Name(), map[string]string{
-				"Destination": apps.ServiceAddressedWaypoint.ServiceName(),
+			t.ConfigIstio().Eval(ingressGatewayNs, map[string]string{
+				"gatewayLabel":   ingressGatewayIstioLabel,
+				"DestinationSvc": apps.ServiceAddressedWaypoint.ServiceName(),
+				"DestinationNs":  apps.ServiceAddressedWaypoint.NamespaceName(),
 			}, `apiVersion: networking.istio.io/v1alpha3
 kind: Gateway
 metadata:
   name: gateway
 spec:
   selector:
-    istio: ingressgateway
+    istio: {{.gatewayLabel}}
   servers:
   - port:
       number: 80
@@ -902,7 +908,7 @@ spec:
   http:
   - route:
     - destination:
-        host: "{{.Destination}}"
+        host: {{.DestinationSvc}}.{{.DestinationNs}}.svc.cluster.local
 `).ApplyOrFail(t)
 			ingress := istio.DefaultIngressOrFail(t, t)
 			t.NewSubTest("endpoint routing").Run(func(t framework.TestContext) {
@@ -928,16 +934,18 @@ spec:
 			})
 		})
 		t.NewSubTest("ingress-workload").Run(func(t framework.TestContext) {
-			t.Skip("not implemented")
-			t.ConfigIstio().Eval(apps.Namespace.Name(), map[string]string{
-				"Destination": apps.WorkloadAddressedWaypoint.ServiceName(),
+			t.Skip("not implemented") // https://github.com/istio/istio/pull/52985#discussion_r2124713907
+			t.ConfigIstio().Eval(ingressGatewayNs, map[string]string{
+				"gatewayLabel":   ingressGatewayIstioLabel,
+				"DestinationSvc": apps.WorkloadAddressedWaypoint.ServiceName(),
+				"DestinationNs":  apps.WorkloadAddressedWaypoint.NamespaceName(),
 			}, `apiVersion: networking.istio.io/v1alpha3
 kind: Gateway
 metadata:
   name: gateway
 spec:
   selector:
-    istio: ingressgateway
+    istio: {{.gatewayLabel}}
   servers:
   - port:
       number: 80
@@ -957,7 +965,7 @@ spec:
   http:
   - route:
     - destination:
-        host: "{{.Destination}}"
+        host: {{.DestinationSvc}}.{{.DestinationNs}}.svc.cluster.local
 `).ApplyOrFail(t)
 			ingress := istio.DefaultIngressOrFail(t, t)
 			t.NewSubTest("endpoint routing").Run(func(t framework.TestContext) {

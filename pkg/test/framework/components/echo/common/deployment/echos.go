@@ -314,7 +314,7 @@ func (c *Config) DefaultEchoConfigs(t resource.Context) []echo.Config {
 			ServiceAccount: true,
 			Ports:          ports.All(),
 			Subsets: []echo.SubsetConfig{{
-				Labels:      map[string]string{label.SidecarInject.Name: "true"},
+				Labels:      map[string]string{label.SidecarInject.Name: "false"}, // add sotw to mesh so captured --> sotw works for different virtualservice settings
 				Annotations: map[string]string{annotation.ProxyConfig.Name: sotw},
 			}},
 		}
