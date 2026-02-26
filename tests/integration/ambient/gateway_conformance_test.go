@@ -68,6 +68,12 @@ var conformanceNamespaces = []string{
 
 var skippedTests = map[string]string{
 	"BackendTLSPolicyConflictResolution": "https://github.com/istio/istio/issues/57817",
+	// Below tests require TLSRoute-experimental feature
+	"HTTPRouteDisallowedKind":       "",
+	"TLSRouteInvalidReferenceGrant": "",
+	"TLSRouteSimpleSameNamespace":   "",
+	// HTTPRouteCORS is an experimental feature
+	"HTTPRouteCORSAllowCredentialsBehavior": "",
 }
 
 func TestGatewayConformance(t *testing.T) {
