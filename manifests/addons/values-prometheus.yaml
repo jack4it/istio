@@ -23,14 +23,14 @@ server:
   # Match legacy addon deployment
   fullnameOverride: prometheus
 
-  # use dockerhub
+  # use Microsoft Container Registry
   image:
-    repository: docker.io/prom/prometheus
+    repository: mcr.microsoft.com/oss/v2/prometheus/prometheus
 
   securityContext: null
 
 configmapReload:
   prometheus:
     image:
-      # Use ghcr
-      repository: ghcr.io/prometheus-operator/prometheus-config-reloader
+      # Use mcr.microsoft.com repository
+      repository: mcr.microsoft.com/oss/v2/prometheus/prometheus-config-reloader
