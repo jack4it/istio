@@ -174,7 +174,14 @@ func deployEchoOrFail(t framework.TestContext, serviceName string, healthy, unhe
 	// NOTE: We cannot just specify replicas 0, because the way the Deployment config template is written
 	// it treats 0 as unset value and defaults to 1 replica in that case defeating the point of setting
 	// replicas to 0 explicitly.
-	scaleDeploymentOrFail(t, unhealthy, ns.Name(), fmt.Sprintf("%s-%s", broken, broken), 0)
+	brokenDeployment := fmt.Sprintf("%s-%s", broken, broken)
+	if t.Settings().Compatibility {
+		for rev := range t.Settings().Revisions {
+			scaleDeploymentOrFail(t, unhealthy, ns.Name(), fmt.Sprintf("%s-%s", brokenDeployment, rev), 0)
+		}
+	} else {
+		scaleDeploymentOrFail(t, unhealthy, ns.Name(), brokenDeployment, 0)
+	}
 
 	return match.ServiceName(echo.NamespacedName{Name: client, Namespace: ns}).GetMatches(echos)
 }
@@ -211,13 +218,9 @@ func scaleDeploymentOrFail(t framework.TestContext, c cluster.Cluster, namespace
 		if err != nil {
 			return fmt.Errorf("failed to find deployment %s in namespace %s: %w", name, namespace, err)
 		}
-		pods, err := c.PodsForSelector(t.Context(), namespace, s.Status.Selector)
-		if err != nil {
-			return fmt.Errorf("failed to query pods matching selector %s in namespace %s: %w", s.Status.Selector, namespace, err)
-		}
-		if s.Status.Replicas == scale && len(pods.Items) == int(scale) {
+		if s.Status.Replicas == scale {
 			return nil
 		}
-		return fmt.Errorf("deployment still has different number of pods, want %d, got %d", scale, len(pods.Items))
+		return fmt.Errorf("deployment %s still has different number of replicas, want %d, got %d", name, scale, s.Status.Replicas)
 	})
 }
