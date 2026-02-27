@@ -72,6 +72,8 @@ var skippedTests = map[string]string{
 	"HTTPRouteDisallowedKind":       "",
 	"TLSRouteInvalidReferenceGrant": "",
 	"TLSRouteSimpleSameNamespace":   "",
+	// HTTPRouteCORS is an experimental feature
+	"HTTPRouteCORSAllowCredentialsBehavior": "",
 }
 
 func TestGatewayConformance(t *testing.T) {
