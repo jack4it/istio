@@ -26,7 +26,6 @@ import (
 	"istio.io/istio/pilot/pkg/serviceregistry/federation"
 	"istio.io/istio/pilot/pkg/serviceregistry/kube/controller/ambient"
 	"istio.io/istio/pkg/log"
-	"istio.io/istio/pkg/network"
 )
 
 // initFederationSync initializes Service Bus–based federation.
@@ -44,9 +43,6 @@ func (s *Server) initFederationSync(args *PilotArgs, serviceControllers *aggrega
 	log.Info("Initializing Service Bus federation")
 
 	stopCh := make(chan struct{})
-
-	// Get local network from feature flag
-	localNetwork := network.ID(features.FederationLocalNetwork)
 
 	// Determine subscription name: use the pod name directly for easy
 	// identification when inspecting Service Bus subscriptions in the portal.
@@ -86,10 +82,14 @@ func (s *Server) initFederationSync(args *PilotArgs, serviceControllers *aggrega
 			return serviceControllers.GetAmbientIndex()
 		},
 		LocalNetworkGatewayGetter: func() *model.NetworkGateway {
-			if s.environment.NetworkManager != nil && localNetwork != "" {
-				gateways := s.environment.NetworkManager.GatewaysForNetwork(localNetwork)
-				if len(gateways) > 0 {
-					return &gateways[0]
+			// Derive local network gateway from configCluster.network (topology.istio.io/network
+			// label on the system namespace) by finding the gateway registered for this cluster.
+			// This eliminates the need for a separate PILOT_FEDERATION_LOCAL_NETWORK env var.
+			if s.environment.NetworkManager != nil {
+				for _, gw := range s.environment.NetworkManager.AllGateways() {
+					if gw.Cluster == s.clusterID {
+						return &gw
+					}
 				}
 			}
 			return nil

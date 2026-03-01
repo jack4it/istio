@@ -91,9 +91,6 @@ var (
 	EnableFederation = registerAmbient("PILOT_ENABLE_FEDERATION", false, false,
 		"If enabled, istiod will use Azure Service Bus pub/sub to synchronize ambient global services with peer istiod instances.")
 
-	FederationLocalNetwork = env.Register("PILOT_FEDERATION_LOCAL_NETWORK", "",
-		"The network ID of the local cluster for federation. Used to identify which network gateway to sync.").Get()
-
 	// Service Bus connection settings (provide connection string OR namespace for Workload Identity).
 
 	ServiceBusConnectionString = env.Register("PILOT_SERVICEBUS_CONNECTION_STRING", "",
