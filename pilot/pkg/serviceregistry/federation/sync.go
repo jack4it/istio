@@ -55,9 +55,6 @@ type SyncProtocol struct {
 	// versionVector tracks local versions for outbound sync messages.
 	versionVector *versionVector
 
-	// tombstones manages deletion markers for outbound sync.
-	tombstones *tombstoneStore
-
 	// ambientIndexGetter returns the ambient index.
 	// This is a getter because the index may not be available at construction time.
 	ambientIndexGetter func() model.FederationAmbientIndex
@@ -156,7 +153,6 @@ func NewSyncProtocol(cfg SyncProtocolConfig) (*SyncProtocol, error) {
 
 	// Create internal components for tracking outbound sync state
 	versionVector := newVersionVector()
-	tombstones := newTombstoneStore(cfg.StopCh)
 
 	// Create a local network getter from the gateway getter
 	localNetworkGetter := func() network.ID {
@@ -175,7 +171,6 @@ func NewSyncProtocol(cfg SyncProtocolConfig) (*SyncProtocol, error) {
 		LocalClusterID:     cfg.LocalClusterID,
 		TrustDomainGetter:  cfg.TrustDomainGetter,
 		LocalNetworkGetter: localNetworkGetter,
-		StopCh:             cfg.StopCh,
 	})
 
 	// Use externally provided federation collections (owned by FederationSource).
@@ -192,7 +187,6 @@ func NewSyncProtocol(cfg SyncProtocolConfig) (*SyncProtocol, error) {
 		store:                     store,
 		localClusterID:            cfg.LocalClusterID,
 		versionVector:             versionVector,
-		tombstones:                tombstones,
 		ambientIndexGetter:        cfg.AmbientIndexGetter,
 		federationServices:        federationServices,
 		federationWorkloads:       federationWorkloads,
@@ -403,7 +397,6 @@ func (sp *SyncProtocol) buildFullSyncMessage() *SyncMessage {
 		ClusterID:      sp.localClusterID,
 		NetworkGateway: sp.getLocalNetworkGateway(),
 		Services:       services,
-		Tombstones:     sp.tombstones.getAll(),
 	}
 
 	syncLog.Infof("Built full sync message: %d services, version=%d",
@@ -525,23 +518,23 @@ func (sp *SyncProtocol) processOutgoingDebounced() {
 			services = append(services, *svc)
 		}
 
-		var tombstones []Tombstone
+		var deletedHostnames []string
 		for hostname := range pendingDeletes {
-			tombstones = append(tombstones, sp.tombstones.add(hostname, sp.localClusterID, version))
+			deletedHostnames = append(deletedHostnames, hostname)
 		}
 
 		msg := &SyncMessage{
-			VersionVector:  sp.versionVector.copy(),
-			FullSync:       false,
-			ClusterID:      sp.localClusterID,
-			NetworkGateway: sp.getLocalNetworkGateway(),
-			Services:       services,
-			Tombstones:     tombstones,
+			VersionVector:    sp.versionVector.copy(),
+			FullSync:         false,
+			ClusterID:        sp.localClusterID,
+			NetworkGateway:   sp.getLocalNetworkGateway(),
+			Services:         services,
+			DeletedHostnames: deletedHostnames,
 		}
 
 		sp.broadcast(msg)
 		syncLog.Infof("Flushed debounced outgoing broadcast: %d services, %d deletes, version=%d",
-			len(services), len(tombstones), version)
+			len(services), len(deletedHostnames), version)
 	}
 }
 

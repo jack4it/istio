@@ -145,7 +145,6 @@ federated data back to its origin cluster.
  │  │  federationStore (store.go)        │  │
  │  │  • handleSyncMessage()             │  │
  │  │  • per-clusterID state sharding    │  │
- │  │  • tombstone tracking              │  │
  │  │  • version vector conflict res.    │  │
  │  │  ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─  │  │
  │  │  Transforms wire services into:    │  │
@@ -211,7 +210,7 @@ federated data back to its origin cluster.
 
 The federation system separates concerns into two layers:
 
-- **`SyncProtocol`** — the federation orchestrator. Owns version vectors, tombstones, store, KRT collections, ambient index integration, snapshot scheduling, and debouncing. Transport-agnostic — it doesn't care how `SyncMessage` arrives.
+- **`SyncProtocol`** — the federation orchestrator. Owns version vectors, store, KRT collections, ambient index integration, snapshot scheduling, and debouncing. Transport-agnostic — it doesn't care how `SyncMessage` arrives.
 - **`ServiceBusTransport`** — a pure send/receive pipe. Handles Azure Service Bus topic publishing, subscription receiving, and two-phase bootstrap drain. No protocol logic.
 
 This separation means the protocol layer can be backed by any pub/sub broker (Kafka, NATS, RabbitMQ) by swapping only the transport implementation.
@@ -380,7 +379,6 @@ Federation only replaces the **control plane service discovery transport** (how 
 | `pilot/pkg/serviceregistry/federation/sync.go` | `SyncProtocol` — federation orchestrator |
 | `pilot/pkg/serviceregistry/federation/store.go` | `federationStore` — remote service data store |
 | `pilot/pkg/serviceregistry/federation/types.go` | `SyncMessage`, wire types |
-| `pilot/pkg/serviceregistry/federation/tombstone.go` | Service tombstone manager |
 | `pilot/pkg/serviceregistry/federation/version.go` | Version vector tracking |
 | `pilot/pkg/features/ambient.go` | Feature flags |
 | `pilot/pkg/bootstrap/federation.go` | `initFederationSync` bootstrap wiring |

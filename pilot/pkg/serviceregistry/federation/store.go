@@ -47,9 +47,6 @@ type federationStore struct {
 	// versionVector tracks versions for conflict resolution.
 	versionVector *versionVector
 
-	// tombstones manages deletion markers.
-	tombstones *tombstoneStore
-
 	// localClusterID is the local cluster's ID.
 	localClusterID cluster.ID
 
@@ -72,9 +69,6 @@ type federationStoreConfig struct {
 
 	// LocalNetworkGetter returns the local network ID.
 	LocalNetworkGetter func() network.ID
-
-	// StopCh signals shutdown.
-	StopCh chan struct{}
 }
 
 // newFederationStore creates a new federation data store.
@@ -82,7 +76,6 @@ func newFederationStore(cfg federationStoreConfig) *federationStore {
 	return &federationStore{
 		shards:             make(map[cluster.ID]*clusterShard),
 		versionVector:      newVersionVector(),
-		tombstones:         newTombstoneStore(cfg.StopCh),
 		localClusterID:     cfg.LocalClusterID,
 		trustDomainGetter:  cfg.TrustDomainGetter,
 		localNetworkGetter: cfg.LocalNetworkGetter,
@@ -137,14 +130,11 @@ func (s *federationStore) handleSyncMessage(msg *SyncMessage) {
 			clusterID, msg.NetworkGateway.Network, msg.NetworkGateway.Addr, msg.NetworkGateway.HBONEPort)
 	}
 
-	// Process tombstones first
-	for _, tombstone := range msg.Tombstones {
-		s.tombstones.addFromRemote(tombstone)
-
-		// Apply deletion
-		if _, ok := shard.Services[tombstone.Key]; ok {
-			delete(shard.Services, tombstone.Key)
-			storeLog.Debugf("Deleted service %s from cluster %s via tombstone", tombstone.Key, clusterID)
+	// Delete services listed in incremental messages
+	for _, hostname := range msg.DeletedHostnames {
+		if _, ok := shard.Services[hostname]; ok {
+			delete(shard.Services, hostname)
+			storeLog.Debugf("Deleted service %s from cluster %s", hostname, clusterID)
 		}
 	}
 
@@ -152,12 +142,6 @@ func (s *federationStore) handleSyncMessage(msg *SyncMessage) {
 	for i := range msg.Services {
 		svc := &msg.Services[i]
 		key := svc.Service.Hostname
-
-		// Check if tombstoned
-		if s.tombstones.isDeleted(key, clusterID, remoteVersion) {
-			continue
-		}
-
 		shard.Services[key] = svc
 	}
 

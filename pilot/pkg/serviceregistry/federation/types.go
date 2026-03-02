@@ -50,8 +50,9 @@ type SyncMessage struct {
 	// This is populated during serialization from Services.
 	WireServices []WireServiceInfo `json:"services,omitempty"`
 
-	// Tombstones contains deletion markers for removed resources.
-	Tombstones []Tombstone
+	// DeletedHostnames contains hostnames of services that were deleted.
+	// Used in incremental (non-full-sync) messages to remove services from the store.
+	DeletedHostnames []string `json:"deletedHostnames,omitempty"`
 }
 
 // WireServiceInfo is a wire-friendly representation of ServiceInfo.
@@ -85,21 +86,6 @@ type WireNetworkGateway struct {
 	ServiceAccount string `json:"serviceAccount,omitempty"`
 	// Namespace is the namespace where the gateway pod resides.
 	Namespace string `json:"namespace,omitempty"`
-}
-
-// Tombstone represents a deletion marker for a service.
-type Tombstone struct {
-	// Key uniquely identifies the deleted service (hostname).
-	Key string
-
-	// DeletedAtUnix is the Unix timestamp when the resource was deleted.
-	DeletedAtUnix int64
-
-	// Version is the version at which the deletion occurred.
-	Version uint64
-
-	// ClusterID identifies which cluster the deletion originated from.
-	ClusterID cluster.ID
 }
 
 // clusterShard holds the synchronized state from a remote cluster.
