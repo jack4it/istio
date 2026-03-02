@@ -360,7 +360,6 @@ Federation only replaces the **control plane service discovery transport** (how 
 | Env Variable | Purpose | Example |
 |---|---|---|
 | `PILOT_ENABLE_FEDERATION` | Feature gate | `true` |
-| `PILOT_FEDERATION_LOCAL_NETWORK` | Local network name for gateway lookup | `network1` |
 | `PILOT_SERVICEBUS_CONNECTION_STRING` | Service Bus connection string | `Endpoint=sb://istio-fed.servicebus.windows.net/;...` |
 | `PILOT_SERVICEBUS_NAMESPACE` | FQDN (for Workload Identity auth) | `istio-fed.servicebus.windows.net` |
 | `PILOT_SERVICEBUS_TOPIC` | Topic name | `istio-service-sync` |

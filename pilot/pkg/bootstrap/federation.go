@@ -82,9 +82,7 @@ func (s *Server) initFederationSync(args *PilotArgs, serviceControllers *aggrega
 			return serviceControllers.GetAmbientIndex()
 		},
 		LocalNetworkGatewayGetter: func() *model.NetworkGateway {
-			// Derive local network gateway from configCluster.network (topology.istio.io/network
-			// label on the system namespace) by finding the gateway registered for this cluster.
-			// This eliminates the need for a separate PILOT_FEDERATION_LOCAL_NETWORK env var.
+			// Find the local cluster's network gateway by matching cluster ID.
 			if s.environment.NetworkManager != nil {
 				for _, gw := range s.environment.NetworkManager.AllGateways() {
 					if gw.Cluster == s.clusterID {
