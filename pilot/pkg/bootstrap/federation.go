@@ -42,19 +42,12 @@ func (s *Server) initFederationSync(args *PilotArgs, serviceControllers *aggrega
 
 	stopCh := make(chan struct{})
 
-	// Use the pod name as the subscription name for easy identification
-	// when inspecting Service Bus subscriptions in the portal.
-	// Pod names include random suffixes (e.g., istiod-7b9f5d8c4-abc12) so
-	// cross-cluster collisions are practically impossible.
-	subscriptionName := args.PodName
-	log.Infof("Using per-replica subscription: %s", subscriptionName)
-
 	// Create the Service Bus transport
 	sbTransport, err := federation.NewServiceBusTransport(federation.ServiceBusConfig{
 		ConnectionString:          features.ServiceBusConnectionString,
 		FullyQualifiedNamespace:   features.ServiceBusNamespace,
 		TopicName:                 features.ServiceBusTopic,
-		SubscriptionName:          subscriptionName,
+		SubscriptionName:          args.PodName,
 		LocalClusterID:            s.clusterID,
 		BootstrapSubscriptionName: features.ServiceBusBootstrapSubscription,
 		StopCh:                    stopCh,
