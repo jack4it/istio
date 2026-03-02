@@ -45,46 +45,12 @@ func (a *index) AllLocalNetworkGlobalServicesWithSANs() []model.ServiceInfo {
 
 	result := make([]model.ServiceInfo, 0, len(services))
 	for _, svc := range services {
-		// Look up local workloads backing this service
-		svcKey := svc.Service.Namespace + "/" + svc.Service.Hostname
-		var wls []model.WorkloadInfo
-		if a.localWorkloadsByServiceKey != nil {
-			wls = a.localWorkloadsByServiceKey.Lookup(svcKey)
+		enriched := a.enrichServiceWithSANs(&svc, meshCfg)
+		if enriched != nil {
+			result = append(result, *enriched)
 		} else {
-			wls = a.workloads.ByServiceKey.Lookup(svcKey)
-		}
-
-		if len(wls) == 0 {
-			// No workloads, return service as-is
 			result = append(result, svc)
-			continue
 		}
-
-		// Collect SANs from all workloads backing this service
-		sans := sets.String{}
-		for _, wl := range wls {
-			san := spiffe.MustGenSpiffeURI(meshCfg.MeshConfig, wl.Workload.Namespace, wl.Workload.ServiceAccount)
-			sans.Insert(san)
-		}
-
-		if sans.IsEmpty() {
-			result = append(result, svc)
-			continue
-		}
-
-		// Merge with any existing SANs
-		sans = sans.Union(sets.New(svc.Service.SubjectAltNames...))
-
-		// Clone and update the service
-		newSvcInfo := model.ServiceInfo{
-			Service:      protomarshal.Clone(svc.Service),
-			Scope:        svc.Scope,
-			CreationTime: svc.CreationTime,
-		}
-		newSvcInfo.Service.SubjectAltNames = sans.UnsortedList()
-		result = append(result, newSvcInfo)
-
-		log.Debugf("Added SANs for service %s: %v", svc.Service.Hostname, sans.UnsortedList())
 	}
 
 	return result
@@ -132,6 +98,13 @@ func (a *index) ServiceWithSANs(svc *model.ServiceInfo) *model.ServiceInfo {
 		return svc
 	}
 
+	return a.enrichServiceWithSANs(svc, meshCfg)
+}
+
+// enrichServiceWithSANs looks up local workloads backing a service,
+// collects their SPIFFE identities, and returns a cloned service with
+// SubjectAltNames populated. Returns nil if no SANs were added.
+func (a *index) enrichServiceWithSANs(svc *model.ServiceInfo, meshCfg *MeshConfig) *model.ServiceInfo {
 	// Look up local workloads backing this service
 	svcKey := svc.Service.Namespace + "/" + svc.Service.Hostname
 	var wls []model.WorkloadInfo
@@ -142,7 +115,7 @@ func (a *index) ServiceWithSANs(svc *model.ServiceInfo) *model.ServiceInfo {
 	}
 
 	if len(wls) == 0 {
-		return svc
+		return nil
 	}
 
 	// Collect SANs from all workloads backing this service
@@ -153,7 +126,7 @@ func (a *index) ServiceWithSANs(svc *model.ServiceInfo) *model.ServiceInfo {
 	}
 
 	if sans.IsEmpty() {
-		return svc
+		return nil
 	}
 
 	// Merge with any existing SANs
@@ -165,7 +138,9 @@ func (a *index) ServiceWithSANs(svc *model.ServiceInfo) *model.ServiceInfo {
 		Scope:        svc.Scope,
 		CreationTime: svc.CreationTime,
 	}
-	newSvcInfo.Service.SubjectAltNames = sans.UnsortedList()
+	newSvcInfo.Service.SubjectAltNames = sets.SortedList(sans)
+
+	log.Debugf("Added SANs for service %s: %v", svc.Service.Hostname, newSvcInfo.Service.SubjectAltNames)
 
 	return newSvcInfo
 }

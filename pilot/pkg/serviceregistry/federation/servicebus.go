@@ -17,6 +17,7 @@ package federation
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"time"
 
@@ -609,6 +610,9 @@ func (t *ServiceBusTransport) receiveLoop() {
 			case <-t.stopCh:
 				return
 			default:
+			}
+			if errors.Is(err, context.DeadlineExceeded) {
+				continue // normal timeout, retry immediately
 			}
 			sbLog.Warnf("Receive error (will retry): %v", err)
 			time.Sleep(time.Second)

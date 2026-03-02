@@ -29,6 +29,7 @@ import (
 	"istio.io/istio/pkg/config/schema/kind"
 	"istio.io/istio/pkg/log"
 	"istio.io/istio/pkg/network"
+	"istio.io/istio/pkg/util/protomarshal"
 	"istio.io/istio/pkg/workloadapi"
 	"k8s.io/apimachinery/pkg/types"
 )
@@ -108,6 +109,11 @@ func (s *federationStore) handleSyncMessage(msg *SyncMessage) {
 		storeLog.Debugf("Ignoring stale message from cluster %s (remote=%d, local=%d)",
 			clusterID, remoteVersion, localVersion)
 		return
+	}
+
+	if msg.FullSync && remoteVersion < localVersion {
+		storeLog.Warnf("Applying full sync from cluster %s with older version (remote=%d, local=%d) — shard will be replaced",
+			clusterID, remoteVersion, localVersion)
 	}
 
 	storeLog.Infof("Processing sync message from cluster %s (full=%v, version=%d, gateway=%v)",
@@ -401,33 +407,34 @@ func (s *federationStore) addLocalNetworkVIPs(svc *model.ServiceInfo, localNetwo
 	}
 
 	// Clone the service to avoid modifying the stored version
-	newSvc := &workloadapi.Service{
-		Name:            svc.Service.Name,
-		Hostname:        svc.Service.Hostname,
-		Namespace:       svc.Service.Namespace,
-		Ports:           svc.Service.Ports,
-		SubjectAltNames: svc.Service.SubjectAltNames,
-		Waypoint:        svc.Service.Waypoint,
-		LoadBalancing:   svc.Service.LoadBalancing,
-		IpFamilies:      svc.Service.IpFamilies,
-	}
+	newSvc := protomarshal.Clone(svc.Service)
 
-	// Add both the original VIPs and local network VIPs
-	seenIPs := make(map[string]bool)
+	// Rebuild addresses from scratch — the clone already copied the original
+	// slice, and we need to add local-network variants while deduplicating.
+	newSvc.Addresses = make([]*workloadapi.NetworkAddress, 0, len(svc.Service.Addresses)*2)
+	seenIPs := make(map[string]bool, len(svc.Service.Addresses)*2)
 	for _, addr := range svc.Service.Addresses {
-		// Keep the original address
+		key := addr.Network + "/" + string(addr.Address)
+		if seenIPs[key] {
+			continue
+		}
+		seenIPs[key] = true
 		newSvc.Addresses = append(newSvc.Addresses, addr)
-		seenIPs[string(addr.Address)] = true
 
 		// Add a local network version if the address is from a different network
 		if addr.Network != localNetwork && addr.Network != "" {
-			localAddr := &workloadapi.NetworkAddress{
-				Network: localNetwork,
-				Address: addr.Address,
+			localKey := localNetwork + "/" + string(addr.Address)
+			if !seenIPs[localKey] {
+				seenIPs[localKey] = true
+				localAddr := &workloadapi.NetworkAddress{
+					Network: localNetwork,
+					Address: addr.Address,
+				}
+				newSvc.Addresses = append(newSvc.Addresses, localAddr)
+				addrStr, _ := netip.AddrFromSlice(addr.Address)
+				storeLog.Debugf("Added local network VIP: %s/%s for service %s",
+					localNetwork, addrStr.String(), svc.Service.Hostname)
 			}
-			newSvc.Addresses = append(newSvc.Addresses, localAddr)
-			storeLog.Debugf("Added local network VIP: %s/%s for service %s",
-				localNetwork, netip.AddrFrom4([4]byte(addr.Address)).String(), svc.Service.Hostname)
 		}
 	}
 
