@@ -360,6 +360,10 @@ func (sd *ServiceDiscovery) AddressInformation(requests sets.String) ([]model.Ad
 	return infos, removed
 }
 
+func (sd *ServiceDiscovery) AmbientNetworkGateways() []model.NetworkGateway {
+	return nil
+}
+
 func (sd *ServiceDiscovery) AdditionalPodSubscriptions(
 	*model.Proxy,
 	sets.String,

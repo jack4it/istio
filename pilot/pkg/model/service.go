@@ -964,6 +964,7 @@ type FederationAmbientIndex interface {
 type AmbientIndexes interface {
 	ServicesWithWaypoint(key string) []ServiceWaypointInfo
 	AddressInformation(addresses sets.String) ([]AddressInfo, sets.String)
+	AmbientNetworkGateways() []NetworkGateway
 	AdditionalPodSubscriptions(
 		proxy *Proxy,
 		allAddresses sets.String,
@@ -1037,6 +1038,10 @@ type NoopAmbientIndexes struct{}
 
 func (u NoopAmbientIndexes) AddressInformation(sets.String) ([]AddressInfo, sets.String) {
 	return nil, nil
+}
+
+func (u NoopAmbientIndexes) AmbientNetworkGateways() []NetworkGateway {
+	return nil
 }
 
 func (u NoopAmbientIndexes) AdditionalPodSubscriptions(

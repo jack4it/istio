@@ -23,6 +23,7 @@ import (
 	"go.uber.org/atomic"
 
 	meshconfig "istio.io/api/mesh/v1alpha1"
+	"istio.io/istio/pilot/pkg/features"
 	"istio.io/istio/pilot/pkg/model"
 	"istio.io/istio/pilot/pkg/serviceregistry"
 	"istio.io/istio/pilot/pkg/serviceregistry/memory"
@@ -30,8 +31,24 @@ import (
 	"istio.io/istio/pilot/pkg/serviceregistry/provider"
 	"istio.io/istio/pkg/cluster"
 	"istio.io/istio/pkg/config/host"
+	"istio.io/istio/pkg/test"
 	"istio.io/istio/pkg/test/util/retry"
+	"istio.io/istio/pkg/workloadapi"
 )
+
+type ambientDiscovery struct {
+	*memory.ServiceDiscovery
+	serviceInfos    map[string]*model.ServiceInfo
+	ambientGateways []model.NetworkGateway
+}
+
+func (a *ambientDiscovery) ServiceInfo(key string) *model.ServiceInfo {
+	return a.serviceInfos[key]
+}
+
+func (a *ambientDiscovery) AmbientNetworkGateways() []model.NetworkGateway {
+	return a.ambientGateways
+}
 
 type mockMeshConfigHolder struct {
 	trustDomainAliases []string
@@ -173,6 +190,71 @@ func TestServicesForMultiCluster(t *testing.T) {
 	// check HelloService is not mutated
 	if !reflect.DeepEqual(originalHelloService, mock.HelloService) {
 		t.Errorf("Original hello service is mutated")
+	}
+}
+
+func TestAmbientLookupsUseConfigClusterRegistry(t *testing.T) {
+	test.SetForTest(t, &features.EnableAmbientMultiNetwork, true)
+
+	localServiceInfo := &model.ServiceInfo{
+		Service: &workloadapi.Service{
+			Name:      "svc",
+			Namespace: "ns",
+			Hostname:  "svc.ns.svc.cluster.local",
+		},
+		Scope: model.Global,
+	}
+	remoteServiceInfo := &model.ServiceInfo{
+		Service: &workloadapi.Service{
+			Name:      "svc",
+			Namespace: "ns",
+			Hostname:  "svc.ns.svc.cluster.local",
+		},
+		Scope: model.Local,
+	}
+
+	localDiscovery := &ambientDiscovery{
+		ServiceDiscovery: memory.NewServiceDiscovery(),
+		serviceInfos: map[string]*model.ServiceInfo{
+			"ns/svc.ns.svc.cluster.local": localServiceInfo,
+		},
+		ambientGateways: []model.NetworkGateway{{
+			Network:   "network-local",
+			Cluster:   "cluster-1",
+			Addr:      "10.0.0.1",
+			HBONEPort: 15008,
+		}},
+	}
+	remoteDiscovery := &ambientDiscovery{
+		ServiceDiscovery: memory.NewServiceDiscovery(),
+		serviceInfos: map[string]*model.ServiceInfo{
+			"ns/svc.ns.svc.cluster.local": remoteServiceInfo,
+		},
+		ambientGateways: []model.NetworkGateway{{
+			Network:   "network-remote",
+			Cluster:   "cluster-2",
+			Addr:      "20.0.0.1",
+			HBONEPort: 15008,
+		}},
+	}
+
+	ctrl := NewController(Options{ConfigClusterID: "cluster-1"})
+	ctrl.AddRegistry(serviceregistry.Simple{
+		ProviderID:          provider.Kubernetes,
+		ClusterID:           "cluster-1",
+		DiscoveryController: localDiscovery,
+	})
+	ctrl.AddRegistry(serviceregistry.Simple{
+		ProviderID:          provider.Kubernetes,
+		ClusterID:           "cluster-2",
+		DiscoveryController: remoteDiscovery,
+	})
+
+	if got := ctrl.ServiceInfo("ns/svc.ns.svc.cluster.local"); got != localServiceInfo {
+		t.Fatalf("expected config-cluster service info, got %#v", got)
+	}
+	if got := ctrl.AmbientNetworkGateways(); !reflect.DeepEqual(got, localDiscovery.ambientGateways) {
+		t.Fatalf("expected config-cluster ambient gateways %v, got %v", localDiscovery.ambientGateways, got)
 	}
 }
 

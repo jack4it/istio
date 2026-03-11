@@ -16,6 +16,7 @@ package ambient
 
 import (
 	"net/netip"
+	"strconv"
 	"strings"
 
 	corev1 "k8s.io/api/core/v1"
@@ -761,6 +762,60 @@ func (a *index) AddressInformation(addresses sets.String) ([]model.AddressInfo, 
 		}
 	}
 	return res, sets.New(removed...)
+}
+
+func (a *index) AmbientNetworkGateways() []model.NetworkGateway {
+	all := LookupAllNetworkGateway(krt.TestingDummyContext{}, a.networks.NetworkGateways)
+	gateways := make(model.NetworkGatewaySet, len(all))
+	for _, gw := range all {
+		gateways.Insert(gw.NetworkGateway)
+	}
+	for _, workload := range a.workloads.List() {
+		if gw, ok := ambientNetworkGatewayFromWorkload(workload); ok {
+			gateways.Insert(gw)
+		}
+	}
+	return model.SortGateways(gateways.UnsortedList())
+}
+
+func ambientNetworkGatewayFromWorkload(workload model.WorkloadInfo) (model.NetworkGateway, bool) {
+	if workload.Workload == nil || !strings.HasPrefix(workload.Workload.Uid, "NetworkGateway/") {
+		return model.NetworkGateway{}, false
+	}
+
+	parts := strings.Split(workload.Workload.Uid, "/")
+	if len(parts) < 4 {
+		return model.NetworkGateway{}, false
+	}
+
+	hbonePort, err := strconv.ParseUint(parts[len(parts)-1], 10, 32)
+	if err != nil {
+		return model.NetworkGateway{}, false
+	}
+	if hbonePort == 0 {
+		return model.NetworkGateway{}, false
+	}
+
+	addr := workload.Workload.Hostname
+	if addr == "" && len(workload.Workload.Addresses) > 0 {
+		if parsed, ok := netip.AddrFromSlice(workload.Workload.Addresses[0]); ok {
+			addr = parsed.String()
+		}
+	}
+	if addr == "" {
+		return model.NetworkGateway{}, false
+	}
+
+	return model.NetworkGateway{
+		Network:   network.ID(workload.Workload.Network),
+		Cluster:   cluster.ID(workload.Workload.ClusterId),
+		Addr:      addr,
+		HBONEPort: uint32(hbonePort),
+		ServiceAccount: types.NamespacedName{
+			Namespace: workload.Workload.Namespace,
+			Name:      workload.Workload.ServiceAccount,
+		},
+	}, true
 }
 
 func (a *index) ServicesForWaypoint(key model.WaypointKey) []model.ServiceInfo {

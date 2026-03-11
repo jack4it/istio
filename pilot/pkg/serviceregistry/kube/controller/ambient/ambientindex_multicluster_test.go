@@ -33,9 +33,11 @@ import (
 	"istio.io/istio/pkg/kube/kclient/clienttest"
 	"istio.io/istio/pkg/kube/krt"
 	"istio.io/istio/pkg/ptr"
+	"istio.io/istio/pkg/spiffe"
 	"istio.io/istio/pkg/test"
 	"istio.io/istio/pkg/test/util/assert"
 	"istio.io/istio/pkg/test/util/retry"
+	"istio.io/istio/pkg/util/sets"
 	"istio.io/istio/pkg/workloadapi"
 )
 
@@ -543,6 +545,109 @@ func TestMulticlusterAmbientIndex_TestServiceMerging(t *testing.T) {
 		}
 		if len(svc.Service.Addresses) != 2 {
 			return fmt.Errorf("expected service to have 2 addresses, got %d", len(svc.Service.Addresses))
+		}
+		return nil
+	})
+}
+
+func TestMulticlusterAmbientIndex_ServiceInfoIncludesWaypointAndAmbientGateways(t *testing.T) {
+	test.SetForTest(t, &features.EnableAmbientMultiNetwork, true)
+	test.SetForTest(t, &features.EnableAmbientWaypoints, true)
+	s := newAmbientTestServer(t, testC, testNW, "")
+	s.AddSecret("s1", "remote-cluster")
+
+	remoteClients := krt.NewCollection(s.remoteClusters, func(_ krt.HandlerContext, c *multicluster.Cluster) **remoteAmbientClients {
+		cl := c.Client
+		return ptr.Of(&remoteAmbientClients{
+			clusterID: c.ID,
+			ambientclients: &ambientclients{
+				pc:    clienttest.NewDirectClient[*corev1.Pod, corev1.Pod, *corev1.PodList](t, cl),
+				sc:    clienttest.NewDirectClient[*corev1.Service, corev1.Service, *corev1.ServiceList](t, cl),
+				ns:    clienttest.NewWriter[*corev1.Namespace](t, cl),
+				grc:   clienttest.NewWriter[*k8sv1.Gateway](t, cl),
+				gwcls: clienttest.NewWriter[*k8sv1.GatewayClass](t, cl),
+				se:    clienttest.NewWriter[*apiv1alpha3.ServiceEntry](t, cl),
+				we:    clienttest.NewWriter[*apiv1alpha3.WorkloadEntry](t, cl),
+				pa:    clienttest.NewWriter[*clientsecurityv1beta1.PeerAuthentication](t, cl),
+				authz: clienttest.NewWriter[*clientsecurityv1beta1.AuthorizationPolicy](t, cl),
+				sec:   clienttest.NewWriter[*corev1.Secret](t, cl),
+			},
+		})
+	})
+
+	const remoteNetwork = "remote-network"
+	assert.EventuallyEqual(t, func() int {
+		return len(remoteClients.List())
+	}, 1)
+
+	remoteClient := remoteClients.List()[0]
+	remoteClient.ns.Create(&corev1.Namespace{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:   systemNS,
+			Labels: map[string]string{label.TopologyNetwork.Name: remoteNetwork},
+		},
+	})
+	remoteClient.ns.Create(&corev1.Namespace{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: testNS,
+		},
+	})
+
+	networkGatewayIP := "172.0.1.2"
+	s.addWaypoint(t, "10.0.0.10", "test-wp", constants.ServiceTraffic, true)
+	s.addNetworkGatewayForClient(t, networkGatewayIP, remoteNetwork, remoteClient.grc)
+	s.addService(t, "svc2",
+		map[string]string{
+			"istio.io/global":             "true",
+			label.IoIstioUseWaypoint.Name: "test-wp",
+		},
+		map[string]string{},
+		[]int32{80}, map[string]string{"app": "a"}, "10.0.0.1",
+	)
+	s.addServiceForClient(t, "svc2",
+		map[string]string{
+			"istio.io/global": "true",
+		},
+		map[string]string{},
+		[]int32{80}, map[string]string{"app": "a"}, "127.1.0.1", remoteClient.sc,
+	)
+	s.addPods(t, "10.0.0.11", "svc2-local", "sa-local", map[string]string{"app": "a"}, nil, true, corev1.PodRunning)
+	s.addPodsForClient(t, "127.1.0.11", "svc2-remote", "sa-remote", map[string]string{"app": "a"}, nil, true, corev1.PodRunning, remoteClient.pc)
+
+	retry.UntilSuccessOrFail(t, func() error {
+		svc := s.ServiceInfo("ns1/svc2.ns1.svc.company.com")
+		if svc == nil {
+			return fmt.Errorf("service info not found")
+		}
+		if svc.Scope != model.Global {
+			return fmt.Errorf("expected service scope to be Global, got %s", svc.Scope)
+		}
+		if len(svc.Service.Addresses) != 2 {
+			return fmt.Errorf("expected merged service to have 2 addresses, got %d", len(svc.Service.Addresses))
+		}
+		if svc.Service.Waypoint == nil || svc.Service.Waypoint.GetHostname() == nil {
+			return fmt.Errorf("expected service waypoint hostname to be populated, got %v", svc.Service.Waypoint)
+		}
+		if got := svc.Service.Waypoint.GetHostname().GetHostname(); got != "test-wp.ns1.svc.company.com" {
+			return fmt.Errorf("expected service waypoint hostname %q, got %q", "test-wp.ns1.svc.company.com", got)
+		}
+		if got := svc.GetLabelSelector(); !reflect.DeepEqual(got, map[string]string{"app": "a"}) {
+			return fmt.Errorf("expected selector %v, got %v", map[string]string{"app": "a"}, got)
+		}
+		if got := svc.PortNames[80]; got.PortName != "tcp-port" {
+			return fmt.Errorf("expected port 80 name %q, got %+v", "tcp-port", got)
+		}
+		expectedRemoteSAN := spiffe.MustGenSpiffeURI(s.meshConfig.Mesh(), testNS, "sa-remote")
+		if got := sets.New(svc.Service.SubjectAltNames...); !got.Contains(expectedRemoteSAN) {
+			return fmt.Errorf("expected SANs to include %q, got %v", expectedRemoteSAN, got.UnsortedList())
+		}
+
+		gws := s.AmbientNetworkGateways()
+		if len(gws) != 1 {
+			return fmt.Errorf("expected 1 ambient network gateway, got %d: %+v", len(gws), gws)
+		}
+		if gws[0].Network != remoteNetwork || gws[0].Addr != networkGatewayIP {
+			return fmt.Errorf("expected ambient gateway %s/%s, got %+v", remoteNetwork, networkGatewayIP, gws[0])
 		}
 		return nil
 	})

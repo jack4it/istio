@@ -2609,6 +2609,10 @@ func (ps *PushContext) SupportsTunnel(n network.ID, ip string) bool {
 	return false
 }
 
+func (ps *PushContext) AmbientNetworkGateways() []NetworkGateway {
+	return ps.ambientIndex.AmbientNetworkGateways()
+}
+
 // WorkloadsForWaypoint returns all workloads associated with a given waypoint identified by it's WaypointKey
 // Used when calculating the workloads which should be configured for a specific waypoint proxy
 func (ps *PushContext) WorkloadsForWaypoint(key WaypointKey) []WorkloadInfo {

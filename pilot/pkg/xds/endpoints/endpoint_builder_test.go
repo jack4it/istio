@@ -28,12 +28,15 @@ import (
 	"istio.io/istio/pilot/pkg/model"
 	"istio.io/istio/pilot/pkg/serviceregistry/memory"
 	"istio.io/istio/pilot/pkg/serviceregistry/util/xdsfake"
+	"istio.io/istio/pilot/test/xdstest"
+	"istio.io/istio/pkg/cluster"
 	"istio.io/istio/pkg/config"
 	"istio.io/istio/pkg/config/constants"
 	"istio.io/istio/pkg/config/host"
 	"istio.io/istio/pkg/config/labels"
 	"istio.io/istio/pkg/config/mesh/meshwatcher"
 	"istio.io/istio/pkg/config/protocol"
+	"istio.io/istio/pkg/network"
 	"istio.io/istio/pkg/test"
 	"istio.io/istio/pkg/workloadapi"
 )
@@ -43,6 +46,7 @@ type localServiceDiscovery struct {
 	services         []*model.Service
 	serviceInstances []*model.ServiceInstance
 	serviceInfos     []*model.ServiceInfo
+	ambientGateways  []model.NetworkGateway
 
 	model.NoopAmbientIndexes
 	model.NetworkGatewaysHandler
@@ -83,6 +87,10 @@ func (l *localServiceDiscovery) NetworkGateways() []model.NetworkGateway {
 
 func (l *localServiceDiscovery) MCSServices() []model.MCSServiceInfo {
 	return nil
+}
+
+func (l *localServiceDiscovery) AmbientNetworkGateways() []model.NetworkGateway {
+	return l.ambientGateways
 }
 
 func (l *localServiceDiscovery) ServiceInfo(key string) *model.ServiceInfo {
@@ -648,6 +656,132 @@ func TestBuildClusterLoadAssignment_InferenceServicePortFiltering(t *testing.T) 
 			if totalEndpoints != tt.expectedEndpoints {
 				t.Errorf("expected %d endpoints, got %d", tt.expectedEndpoints, totalEndpoints)
 			}
+		})
+	}
+}
+
+func TestBuildClusterLoadAssignment_AmbientUsesAmbientNetworkGateways(t *testing.T) {
+	test.SetForTest(t, &features.EnableAmbient, true)
+	test.SetForTest(t, &features.EnableAmbientMultiNetwork, true)
+	test.SetForTest(t, &features.EnableAmbientWaypointMultiNetwork, true)
+	test.SetForTest(t, &features.EnableAmbientIngressMultiNetwork, true)
+
+	svc := &model.Service{
+		Hostname: "example.ns.svc.cluster.local",
+		Attributes: model.ServiceAttributes{
+			Name:      "example",
+			Namespace: "ns",
+		},
+		Ports: model.PortList{{Port: 80, Protocol: protocol.HTTP, Name: "http"}},
+	}
+	globalSvc := makeService("ns", "example.ns.svc.cluster.local", model.Global)
+
+	endpointIndex := model.NewEndpointIndex(model.NewXdsCache())
+	shards, _ := endpointIndex.GetOrCreateEndpointShard("example.ns.svc.cluster.local", "ns")
+	shards.Lock()
+	shards.Shards[model.ShardKey{Cluster: "cluster2"}] = []*model.IstioEndpoint{{
+		Addresses:       []string{"20.0.0.1"},
+		Network:         "network2",
+		Locality:        model.Locality{ClusterID: "cluster2"},
+		ServicePortName: "http",
+		EndpointPort:    8080,
+		HostName:        "example.ns.svc.cluster.local",
+		Namespace:       "ns",
+		TLSMode:         model.IstioMutualTLSModeLabel,
+	}}
+	shards.Unlock()
+
+	tests := []struct {
+		name        string
+		proxy       *model.Proxy
+		direction   model.TrafficDirection
+		subset      string
+		clusterName string
+	}{
+		{
+			name: "waypoint proxy",
+			proxy: &model.Proxy{
+				Type: model.Waypoint,
+				Metadata: &model.NodeMetadata{
+					Namespace: "ns",
+					Network:   network.ID("network1"),
+					ClusterID: cluster.ID("cluster1"),
+				},
+				Labels: map[string]string{label.GatewayManaged.Name: constants.ManagedGatewayMeshControllerLabel},
+			},
+			direction:   model.TrafficDirectionOutbound,
+			clusterName: model.BuildSubsetKey(model.TrafficDirectionOutbound, "", svc.Hostname, 80),
+		},
+		{
+			name: "waypoint inbound-vip cluster",
+			proxy: &model.Proxy{
+				Type: model.Waypoint,
+				Metadata: &model.NodeMetadata{
+					Namespace: "ns",
+					Network:   network.ID("network1"),
+					ClusterID: cluster.ID("cluster1"),
+				},
+				Labels: map[string]string{label.GatewayManaged.Name: constants.ManagedGatewayMeshControllerLabel},
+			},
+			direction:   model.TrafficDirectionInboundVIP,
+			subset:      "http",
+			clusterName: model.BuildSubsetKey(model.TrafficDirectionInboundVIP, "http", svc.Hostname, 80),
+		},
+		{
+			name: "ingress gateway proxy",
+			proxy: &model.Proxy{
+				Type: model.Router,
+				Metadata: &model.NodeMetadata{
+					Namespace: "ns",
+					Network:   network.ID("network1"),
+					ClusterID: cluster.ID("cluster1"),
+				},
+				Labels: map[string]string{label.GatewayManaged.Name: constants.ManagedGatewayControllerLabel},
+			},
+			direction:   model.TrafficDirectionOutbound,
+			clusterName: model.BuildSubsetKey(model.TrafficDirectionOutbound, "", svc.Hostname, 80),
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			env := model.NewEnvironment()
+			env.ConfigStore = model.NewFakeStore()
+			env.Watcher = meshwatcher.NewTestWatcher(&meshconfig.MeshConfig{RootNamespace: "istio-system"})
+			env.NetworksWatcher = meshwatcher.NewFixedNetworksWatcher(nil)
+			env.ServiceDiscovery = memory.NewServiceDiscovery()
+			if err := env.InitNetworksManager(xdsfake.NewFakeXDS()); err != nil {
+				t.Fatal(err)
+			}
+			env.ServiceDiscovery = &localServiceDiscovery{
+				services:     []*model.Service{svc},
+				serviceInfos: []*model.ServiceInfo{globalSvc},
+				ambientGateways: []model.NetworkGateway{{
+					Network:   "network2",
+					Cluster:   "cluster2",
+					Addr:      "2.2.2.2",
+					HBONEPort: 15008,
+				}},
+			}
+			env.Init()
+
+			push := model.NewPushContext()
+			push.InitContext(env, nil, nil)
+
+			builder := NewCDSEndpointBuilder(
+				tt.proxy, push,
+				tt.clusterName,
+				tt.direction, tt.subset, "example.ns.svc.cluster.local", 80,
+				svc, nil,
+			)
+			cla := builder.BuildClusterLoadAssignment(endpointIndex)
+			if cla.ClusterName != tt.clusterName {
+				t.Fatalf("expected cluster name %q, got %q", tt.clusterName, cla.ClusterName)
+			}
+			xdstest.CompareEndpointsOrFail(t, cla.ClusterName, cla.Endpoints, []xdstest.LocLbEpInfo{{
+				LbEps:  []xdstest.LbEpInfo{{Address: "2.2.2.2", Weight: 1}},
+				Weight: 1,
+			}})
 		})
 	}
 }

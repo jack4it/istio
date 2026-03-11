@@ -421,6 +421,18 @@ func (c *Controller) NetworkGateways() []model.NetworkGateway {
 	return gws
 }
 
+func (c *Controller) AmbientNetworkGateways() []model.NetworkGateway {
+	if !features.EnableAmbientMultiNetwork {
+		return nil
+	}
+	for _, p := range c.GetRegistries() {
+		if p.Cluster() == c.configClusterID && p.Provider() == provider.Kubernetes {
+			return p.AmbientNetworkGateways()
+		}
+	}
+	return nil
+}
+
 func (c *Controller) MCSServices() []model.MCSServiceInfo {
 	var out []model.MCSServiceInfo
 	for _, r := range c.GetRegistries() {

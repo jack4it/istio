@@ -20,7 +20,6 @@ import (
 	"istio.io/istio/pkg/kube/krt"
 	"istio.io/istio/pkg/log"
 	"istio.io/istio/pkg/spiffe"
-	"istio.io/istio/pkg/util/protomarshal"
 	"istio.io/istio/pkg/util/sets"
 )
 
@@ -133,11 +132,7 @@ func (a *index) enrichServiceWithSANs(svc *model.ServiceInfo, meshCfg *MeshConfi
 	sans = sans.Union(sets.New(svc.Service.SubjectAltNames...))
 
 	// Clone and update the service
-	newSvcInfo := &model.ServiceInfo{
-		Service:      protomarshal.Clone(svc.Service),
-		Scope:        svc.Scope,
-		CreationTime: svc.CreationTime,
-	}
+	newSvcInfo := cloneServiceInfoPreservingMetadata(*svc)
 	newSvcInfo.Service.SubjectAltNames = sets.SortedList(sans)
 
 	log.Debugf("Added SANs for service %s: %v", svc.Service.Hostname, newSvcInfo.Service.SubjectAltNames)

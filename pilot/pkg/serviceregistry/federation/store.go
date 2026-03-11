@@ -448,7 +448,11 @@ func (s *federationStore) addLocalNetworkVIPs(svc *model.ServiceInfo, localNetwo
 
 	return &model.ServiceInfo{
 		Service:          newSvc,
+		LabelSelector:    svc.LabelSelector,
+		PortNames:        svc.PortNames,
+		Source:           svc.Source,
 		Scope:            svc.Scope,
+		Waypoint:         svc.Waypoint,
 		CreationTime:     svc.CreationTime,
 		MarshaledAddress: marshaled,
 		AsAddress: model.AddressInfo{

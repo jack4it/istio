@@ -280,10 +280,15 @@ func (b *EndpointBuilder) EndpointsByNetworkFilter(endpoints []*LocalityEndpoint
 //     where the exported endpoints reside, we ensure that we only send traffic to exported endpoints.
 func (b *EndpointBuilder) selectNetworkGateways(nw network.ID, c cluster.ID) []model.NetworkGateway {
 	// Get the gateways for this network+cluster combination.
-	gws := b.gateways().GatewaysForNetworkAndCluster(nw, c)
+	legacyGws := b.gateways().GatewaysForNetworkAndCluster(nw, c)
+	gws := legacyGws
 	if len(gws) == 0 {
 		// No match for network+cluster, just match the network.
 		gws = b.gateways().GatewaysForNetwork(nw)
+	}
+	if features.EnableAmbientMultiNetwork && !isSidecarProxy(b.proxy) {
+		selectedAmbientGws := selectGatewaysFromList(b.push.AmbientNetworkGateways(), nw, c)
+		gws = mergeGatewayLists(gws, selectedAmbientGws)
 	}
 
 	// If we operate in ambient multi-network mode skip gateways that don't have HBONE port
@@ -313,6 +318,36 @@ func (b *EndpointBuilder) selectNetworkGateways(nw network.ID, c cluster.ID) []m
 	}
 
 	return gws
+}
+
+func selectGatewaysFromList(gws []model.NetworkGateway, nw network.ID, c cluster.ID) []model.NetworkGateway {
+	var networkAndClusterMatch []model.NetworkGateway
+	for _, gw := range gws {
+		if gw.Network == nw && gw.Cluster == c {
+			networkAndClusterMatch = append(networkAndClusterMatch, gw)
+		}
+	}
+	if len(networkAndClusterMatch) > 0 {
+		return model.SortGateways(networkAndClusterMatch)
+	}
+
+	var networkMatch []model.NetworkGateway
+	for _, gw := range gws {
+		if gw.Network == nw {
+			networkMatch = append(networkMatch, gw)
+		}
+	}
+	return model.SortGateways(networkMatch)
+}
+
+func mergeGatewayLists(primary, additional []model.NetworkGateway) []model.NetworkGateway {
+	if len(additional) == 0 {
+		return primary
+	}
+	merged := model.NetworkGatewaySet{}
+	merged.InsertAll(primary...)
+	merged.InsertAll(additional...)
+	return model.SortGateways(merged.UnsortedList())
 }
 
 func (b *EndpointBuilder) scaleEndpointLBWeight(ep *endpoint.LbEndpoint, scaleFactor uint32) uint32 {

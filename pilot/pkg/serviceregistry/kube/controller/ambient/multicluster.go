@@ -31,6 +31,7 @@ import (
 	"istio.io/istio/pilot/pkg/model"
 	"istio.io/istio/pilot/pkg/serviceregistry/kube/controller/ambient/multicluster"
 	"istio.io/istio/pilot/pkg/serviceregistry/kube/controller/ambient/statusqueue"
+	"istio.io/istio/pilot/pkg/serviceregistry/provider"
 	labelutil "istio.io/istio/pilot/pkg/serviceregistry/util/label"
 	"istio.io/istio/pkg/cluster"
 	"istio.io/istio/pkg/config/constants"
@@ -472,6 +473,37 @@ func (a *index) buildGlobalCollections(
 	SplitHorizonWorkloadServiceIndex := krt.NewIndex[string, model.WorkloadInfo](SplitHorizonWorkloads, "service", func(o model.WorkloadInfo) []string {
 		return maps.Keys(o.Workload.Services)
 	})
+	SyntheticSplitHorizonWorkloads := krt.NewCollection(
+		SplitHorizonWorkloads,
+		func(ctx krt.HandlerContext, wi model.WorkloadInfo) *model.WorkloadInfo {
+			if wi.Workload == nil || len(wi.Workload.Services) == 0 {
+				return nil
+			}
+			if strings.HasPrefix(wi.Workload.Uid, "NetworkGateway/") {
+				return nil
+			}
+			if wi.Workload.Network == a.Network(ctx).String() {
+				return nil
+			}
+			return &wi
+		},
+		opts.WithName("SyntheticSplitHorizonWorkloads")...,
+	)
+	SyntheticSplitHorizonWorkloadServiceShardIndex := krt.NewIndex[string, model.WorkloadInfo](
+		SyntheticSplitHorizonWorkloads,
+		"service;shard",
+		func(o model.WorkloadInfo) []string {
+			if o.Workload == nil {
+				return nil
+			}
+			res := make([]string, 0, len(o.Workload.Services))
+			shard := syntheticSplitHorizonShardKey(o)
+			for svc := range o.Workload.Services {
+				res = append(res, syntheticSplitHorizonServiceShardIndexKey(svc, shard))
+			}
+			return res
+		},
+	)
 	SplitHorizonWorkloadWaypointIndexHostname := krt.NewIndex(SplitHorizonWorkloads, "namespaceHostname", func(w model.WorkloadInfo) []NamespaceHostname {
 		// Filter out waypoints.
 		if w.Labels[label.GatewayManaged.Name] == constants.ManagedGatewayMeshControllerLabel {
@@ -547,11 +579,7 @@ func (a *index) buildGlobalCollections(
 			}
 			sans = sans.Union(sets.New(svc.Service.SubjectAltNames...))
 
-			newSvcInfo := &model.ServiceInfo{
-				Service:      protomarshal.Clone(svc.Service),
-				Scope:        svc.Scope,
-				CreationTime: svc.CreationTime,
-			}
+			newSvcInfo := cloneServiceInfoPreservingMetadata(svc)
 			newSvcInfo.Service.SubjectAltNames = sans.UnsortedList()
 			return precomputeServicePtr(newSvcInfo)
 		},
@@ -564,6 +592,42 @@ func (a *index) buildGlobalCollections(
 		},
 		PushXdsAddress(a.XDSUpdater, model.ServiceInfo.ResourceName),
 	), false)
+	SyntheticSplitHorizonServiceShardEndpoints := krt.NewCollection(
+		SyntheticSplitHorizonWorkloadServiceShardIndex.AsCollection(opts.WithName("SyntheticSplitHorizonWorkloadServiceShardIndex")...),
+		func(ctx krt.HandlerContext, i krt.IndexObject[string, model.WorkloadInfo]) *syntheticServiceShardEndpoints {
+			serviceKey, shard, ok := parseSyntheticSplitHorizonServiceShardIndexKey(i.Key)
+			if !ok {
+				log.Errorf("Invalid key %s for SyntheticSplitHorizonWorkloadServiceShardIndex", i.Key)
+				return nil
+			}
+			svc := krt.FetchOne(ctx, SplitHorizonServices, krt.FilterKey(serviceKey))
+			if svc == nil || !shouldPublishSyntheticSplitHorizonEDS(*svc) {
+				return nil
+			}
+			namespace, hostname, found := strings.Cut(serviceKey, "/")
+			if !found {
+				log.Errorf("Invalid service key %s for SyntheticSplitHorizonWorkloadServiceShardIndex", serviceKey)
+				return nil
+			}
+			return &syntheticServiceShardEndpoints{
+				ServiceHostname: hostname,
+				Namespace:       namespace,
+				Shard:           shard,
+				Endpoints:       buildSyntheticSplitHorizonEndpoints(i.Objects, *svc),
+			}
+		},
+		opts.WithName("SyntheticSplitHorizonServiceShardEndpoints")...,
+	)
+	SyntheticSplitHorizonServiceShardEndpoints.RegisterBatch(func(events []krt.Event[syntheticServiceShardEndpoints]) {
+		for _, event := range events {
+			latest := event.Latest()
+			endpoints := latest.Endpoints
+			if event.Event == controllers.EventDelete {
+				endpoints = nil
+			}
+			a.XDSUpdater.EDSUpdate(latest.Shard, latest.ServiceHostname, latest.Namespace, endpoints)
+		}
+	}, false)
 
 	SplitHorizonServiceAddressIndex := krt.NewIndex[networkAddress, model.ServiceInfo](SplitHorizonServices, "serviceAddress", networkAddressFromService)
 	SplitHorizonServiceInfosByOwningWaypointHostname := krt.NewIndex(SplitHorizonServices, "namespaceHostname", func(s model.ServiceInfo) []NamespaceHostname {
@@ -891,6 +955,125 @@ func wrapObjectWithCluster[T any](clusterID cluster.ID) func(obj T) krt.ObjectWi
 	return func(obj T) krt.ObjectWithCluster[T] {
 		return krt.ObjectWithCluster[T]{ClusterID: clusterID, Object: &obj}
 	}
+}
+
+type syntheticServiceShardEndpoints struct {
+	ServiceHostname string
+	Namespace       string
+	Shard           model.ShardKey
+	Endpoints       []*model.IstioEndpoint
+}
+
+func (s syntheticServiceShardEndpoints) ResourceName() string {
+	return syntheticSplitHorizonServiceShardIndexKey(s.Namespace+"/"+s.ServiceHostname, s.Shard)
+}
+
+func (s syntheticServiceShardEndpoints) Equals(other syntheticServiceShardEndpoints) bool {
+	if s.ServiceHostname != other.ServiceHostname || s.Namespace != other.Namespace || s.Shard != other.Shard {
+		return false
+	}
+	if len(s.Endpoints) != len(other.Endpoints) {
+		return false
+	}
+	for i := range s.Endpoints {
+		if !s.Endpoints[i].Equals(other.Endpoints[i]) {
+			return false
+		}
+	}
+	return true
+}
+
+func shouldPublishSyntheticSplitHorizonEDS(svc model.ServiceInfo) bool {
+	return svc.Service != nil && svc.Service.Waypoint != nil
+}
+
+func syntheticSplitHorizonShardKey(wl model.WorkloadInfo) model.ShardKey {
+	return model.ShardKey{Cluster: cluster.ID(wl.Workload.ClusterId), Provider: provider.Kubernetes}
+}
+
+func syntheticSplitHorizonServiceShardIndexKey(serviceKey string, shard model.ShardKey) string {
+	return serviceKey + ";" + shard.Cluster.String()
+}
+
+func parseSyntheticSplitHorizonServiceShardIndexKey(key string) (string, model.ShardKey, bool) {
+	serviceKey, clusterName, found := strings.Cut(key, ";")
+	if !found {
+		return "", model.ShardKey{}, false
+	}
+	return serviceKey, model.ShardKey{Cluster: cluster.ID(clusterName), Provider: provider.Kubernetes}, true
+}
+
+func buildSyntheticSplitHorizonEndpoints(workloads []model.WorkloadInfo, svc model.ServiceInfo) []*model.IstioEndpoint {
+	serviceKey := svc.ResourceName()
+	endpoints := make([]*model.IstioEndpoint, 0, len(workloads))
+	for _, wl := range workloads {
+		if wl.Workload == nil {
+			continue
+		}
+		ports := wl.Workload.Services[serviceKey]
+		if ports == nil {
+			continue
+		}
+		address := syntheticSplitHorizonEndpointAddress(wl, svc)
+		for _, port := range ports.Ports {
+			portName, ok := svc.PortNames[int32(port.ServicePort)]
+			if !ok || portName.PortName == "" {
+				continue
+			}
+			endpointPort := port.TargetPort
+			if endpointPort == 0 {
+				endpointPort = port.ServicePort
+			}
+			endpoints = append(endpoints, &model.IstioEndpoint{
+				Addresses:       []string{address},
+				EndpointPort:    endpointPort,
+				ServicePortName: portName.PortName,
+				Network:         network.ID(wl.Workload.Network),
+				Locality: model.Locality{
+					ClusterID: cluster.ID(wl.Workload.ClusterId),
+				},
+				Labels:         maps.Clone(wl.Labels),
+				ServiceAccount: wl.Workload.ServiceAccount,
+				TLSMode:        model.IstioMutualTLSModeLabel,
+				WorkloadName:   wl.Workload.Name,
+				Namespace:      wl.Workload.Namespace,
+				HostName:       svc.Service.Hostname,
+				HealthStatus:   model.Healthy,
+			})
+		}
+	}
+	return slices.SortBy(endpoints, func(ep *model.IstioEndpoint) string {
+		return ep.ServicePortName + ";" + ep.FirstAddressOrNil() + ";" + ep.Locality.ClusterID.String()
+	})
+}
+
+func syntheticSplitHorizonEndpointAddress(wl model.WorkloadInfo, svc model.ServiceInfo) string {
+	for _, raw := range wl.Workload.Addresses {
+		if addr, ok := netip.AddrFromSlice(raw); ok {
+			return addr.String()
+		}
+	}
+	for _, addr := range svc.Service.Addresses {
+		if addr.Network != wl.Workload.Network {
+			continue
+		}
+		if parsed, ok := netip.AddrFromSlice(addr.Address); ok {
+			return parsed.String()
+		}
+	}
+	for _, addr := range svc.Service.Addresses {
+		if parsed, ok := netip.AddrFromSlice(addr.Address); ok {
+			return parsed.String()
+		}
+	}
+	if gateway := wl.Workload.GetNetworkGateway(); gateway != nil {
+		if addr := gateway.GetAddress(); addr != nil {
+			if parsed, ok := netip.AddrFromSlice(addr.Address); ok {
+				return parsed.String()
+			}
+		}
+	}
+	return "240.0.0.1"
 }
 
 func (a *index) createSplitHorizonWorkload(

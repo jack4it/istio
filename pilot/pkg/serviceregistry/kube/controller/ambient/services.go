@@ -736,6 +736,18 @@ func precomputeService(w model.ServiceInfo) model.ServiceInfo {
 	return w
 }
 
+func cloneServiceInfoPreservingMetadata(w model.ServiceInfo) *model.ServiceInfo {
+	return &model.ServiceInfo{
+		Service:       protomarshal.Clone(w.Service),
+		LabelSelector: w.LabelSelector,
+		PortNames:     w.PortNames,
+		Source:        w.Source,
+		Scope:         w.Scope,
+		Waypoint:      w.Waypoint,
+		CreationTime:  w.CreationTime,
+	}
+}
+
 // setCanonical sets the canonical field in a WDS service without mangling the ServiceInfo
 func setCanonical(se *model.ServiceInfo) model.ServiceInfo {
 	wdsSvc := protomarshal.ShallowClone(se.Service)

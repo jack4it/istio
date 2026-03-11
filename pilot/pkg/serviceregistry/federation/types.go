@@ -15,6 +15,8 @@
 package federation
 
 import (
+	"time"
+
 	"google.golang.org/protobuf/proto"
 
 	"istio.io/istio/pilot/pkg/model"
@@ -69,6 +71,21 @@ type WireServiceInfo struct {
 
 	// Scope indicates if the service is local or global
 	Scope model.ServiceScope `json:"scope,omitempty"`
+
+	// LabelSelector preserves the service selector metadata needed by ambient internals.
+	LabelSelector model.LabelSelector `json:"labelSelector,omitempty"`
+
+	// PortNames preserves the service-port to target-port name mapping.
+	PortNames map[int32]model.ServicePortName `json:"portNames,omitempty"`
+
+	// Source identifies the originating resource for status and conflict handling.
+	Source model.TypedObject `json:"source,omitempty"`
+
+	// Waypoint preserves service waypoint binding status used by ambient and status code.
+	Waypoint model.WaypointBindingStatus `json:"waypoint,omitempty"`
+
+	// CreationTime preserves deterministic merge ordering metadata.
+	CreationTime time.Time `json:"creationTime,omitempty"`
 }
 
 // WireNetworkGateway represents network gateway information synced via federation.
@@ -110,9 +127,14 @@ func ToWireServiceInfo(svc *model.ServiceInfo) WireServiceInfo {
 	}
 
 	wire := WireServiceInfo{
-		Hostname:  svc.Service.Hostname,
-		Namespace: svc.Service.Namespace,
-		Scope:     svc.Scope,
+		Hostname:      svc.Service.Hostname,
+		Namespace:     svc.Service.Namespace,
+		Scope:         svc.Scope,
+		LabelSelector: svc.LabelSelector,
+		PortNames:     svc.PortNames,
+		Source:        svc.Source,
+		Waypoint:      svc.Waypoint,
+		CreationTime:  svc.CreationTime,
 	}
 
 	// Serialize the protobuf Service
@@ -145,7 +167,12 @@ func (w *WireServiceInfo) ToServiceInfo() *model.ServiceInfo {
 
 	return &model.ServiceInfo{
 		Service:          svc,
+		LabelSelector:    w.LabelSelector,
+		PortNames:        w.PortNames,
+		Source:           w.Source,
 		Scope:            w.Scope,
+		Waypoint:         w.Waypoint,
+		CreationTime:     w.CreationTime,
 		MarshaledAddress: marshaled,
 		AsAddress: model.AddressInfo{
 			Address:   addr,
