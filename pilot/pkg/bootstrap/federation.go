@@ -30,7 +30,7 @@ import (
 // This enables pub/sub synchronization of ambient global services via Azure Service Bus.
 //
 // Multi-replica behavior:
-//   - Each replica auto-creates its own Service Bus subscription (<clusterID>-<podName>)
+//   - Each replica auto-creates its own Service Bus subscription (named after the pod)
 //     with autoDeleteOnIdle=30m, ensuring all replicas receive ALL inbound messages
 //     and maintain complete federation state. Bootstrap peeks from a shared subscription.
 //   - Leader election gates outbound publishing: only the leader publishes snapshots
@@ -67,9 +67,10 @@ func (s *Server) initFederationSync(args *PilotArgs, serviceControllers *aggrega
 		LocalNetworkGatewayGetter: func() *model.NetworkGateway {
 			// Find the local cluster's network gateway by matching cluster ID.
 			if s.environment.NetworkManager != nil {
-				for _, gw := range s.environment.NetworkManager.AllGateways() {
-					if gw.Cluster == s.clusterID {
-						return &gw
+				gateways := s.environment.NetworkManager.AllGateways()
+				for i := range gateways {
+					if gateways[i].Cluster == s.clusterID {
+						return &gateways[i]
 					}
 				}
 			}

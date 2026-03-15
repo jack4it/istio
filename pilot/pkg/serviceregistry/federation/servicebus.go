@@ -19,6 +19,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/Azure/azure-sdk-for-go/sdk/azidentity"
@@ -141,6 +142,9 @@ func NewServiceBusTransport(cfg ServiceBusConfig) (*ServiceBusTransport, error) 
 	}
 	if cfg.SubscriptionName == "" {
 		return nil, fmt.Errorf("SubscriptionName is required")
+	}
+	if cfg.StopCh == nil {
+		return nil, fmt.Errorf("StopCh is required")
 	}
 
 	var client *azservicebus.Client
@@ -347,6 +351,9 @@ func (t *ServiceBusTransport) peekBootstrapMessages() []*SyncMessage {
 			var syncMsg SyncMessage
 			if err := json.Unmarshal(m.Body, &syncMsg); err != nil {
 				sbLog.Warnf("Bootstrap peek: failed to unmarshal message, skipping: %v", err)
+				if m.SequenceNumber != nil && *m.SequenceNumber >= fromSeqNum {
+					fromSeqNum = *m.SequenceNumber + 1
+				}
 				continue
 			}
 
@@ -521,8 +528,10 @@ func (t *ServiceBusTransport) ensureSubscription() error {
 	// Delete the default $Default rule (matches all messages)
 	_, _ = t.adminClient.DeleteRule(ctx, t.topicName, t.subscriptionName, "$Default", nil)
 
-	// Create SQL filter to exclude messages from this cluster
-	filterExpr := fmt.Sprintf("ClusterID <> '%s'", string(t.localClusterID))
+	// Create SQL filter to exclude messages from this cluster.
+	// Escape single quotes in cluster ID to prevent SQL filter injection.
+	escapedClusterID := strings.ReplaceAll(string(t.localClusterID), "'", "''")
+	filterExpr := fmt.Sprintf("ClusterID <> '%s'", escapedClusterID)
 	ruleName := "filterSelfCluster"
 	_, err = t.adminClient.CreateRule(ctx, t.topicName, t.subscriptionName, &admin.CreateRuleOptions{
 		Name:   &ruleName,
