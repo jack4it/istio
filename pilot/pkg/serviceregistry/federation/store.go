@@ -141,6 +141,9 @@ func (s *federationStore) handleSyncMessage(msg *SyncMessage) {
 		s.shards[clusterID] = shard
 	}
 
+	// Invalidate projection cache — the shard is about to be mutated.
+	shard.cachedProjection = nil
+
 	// Refresh liveness timestamp on every accepted message.
 	shard.LastSeen = time.Now()
 
@@ -220,6 +223,7 @@ func (s *federationStore) expireStaleShards(expiry time.Duration, now time.Time)
 			shard.Tombstoned = true
 			shard.Services = nil
 			shard.NetworkGateway = nil
+			shard.cachedProjection = nil
 			expired = append(expired, cid)
 			shardsExpired.Increment()
 		}
@@ -245,9 +249,15 @@ func (s *federationStore) recordShardGauges() {
 
 // getFederationState returns all services and workloads from the federation store.
 // This is used to populate KRT collections for ambient index integration.
+//
+// Each shard's derived services and workloads are cached in a per-shard projection.
+// Only shards whose data changed since the last call are recomputed. The final
+// aggregation (concatenation + cross-shard gateway deduplication) is always done,
+// but it is cheap compared to the per-service proto cloning and workload construction
+// that the projection cache avoids.
 func (s *federationStore) getFederationState() ([]model.ServiceInfo, []model.WorkloadInfo) {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
+	s.mu.Lock()
+	defer s.mu.Unlock()
 
 	// Get the local network ID for adding local VIPs
 	var localNetwork string
@@ -269,55 +279,80 @@ func (s *federationStore) getFederationState() ([]model.ServiceInfo, []model.Wor
 		if shard.Tombstoned {
 			continue
 		}
-		// Create a NetworkGateway workload for each remote gateway.
-		// This is needed so ztunnel knows how to reach the remote gateway
-		// when routing traffic to split-horizon workloads.
-		if shard.NetworkGateway != nil {
-			gwKey := fmt.Sprintf("%s/%s/%d/%s",
-				shard.NetworkGateway.Network, shard.NetworkGateway.Addr,
-				shard.NetworkGateway.HBONEPort, shard.ClusterID)
-			if !seenGateways[gwKey] {
-				seenGateways[gwKey] = true
-				gwWorkload := s.createNetworkGatewayWorkload(shard.NetworkGateway)
-				if gwWorkload != nil {
-					workloads = append(workloads, *gwWorkload)
-				}
-			}
+
+		// Use cached projection if available, otherwise rebuild it.
+		proj := shard.cachedProjection
+		if proj == nil {
+			projectionCacheMisses.Increment()
+			proj = s.buildShardProjection(shard, localNetwork)
+			shard.cachedProjection = proj
+		} else {
+			projectionCacheHits.Increment()
 		}
 
-		for _, svc := range shard.Services {
-			if svc == nil || svc.Service == nil {
-				continue
-			}
+		services = append(services, proj.Services...)
 
-			// Add local network VIPs to the service so ztunnel can find it.
-			// ztunnel looks up services using the source workload's network,
-			// so we need VIPs with both the original network and the local network.
-			localizedSvc := s.addLocalNetworkVIPs(svc, localNetwork)
-			services = append(services, *localizedSvc)
-
-			// Create split-horizon workloads for services that have a network gateway
-			if shard.NetworkGateway != nil {
-				// Convert WireNetworkGateway to model.NetworkGateway
-				gw := model.NetworkGateway{
-					Network:   network.ID(shard.NetworkGateway.Network),
-					Cluster:   cluster.ID(shard.NetworkGateway.Cluster),
-					Addr:      shard.NetworkGateway.Addr,
-					HBONEPort: shard.NetworkGateway.HBONEPort,
-					ServiceAccount: types.NamespacedName{
-						Name:      shard.NetworkGateway.ServiceAccount,
-						Namespace: shard.NetworkGateway.Namespace,
-					},
+		// Append workloads with cross-shard gateway deduplication.
+		for i := range proj.Workloads {
+			wl := &proj.Workloads[i]
+			// Gateway workloads have UIDs like "NetworkGateway/network/addr/port".
+			// Split-horizon workloads are never duplicated across shards.
+			if strings.HasPrefix(wl.Workload.Uid, "NetworkGateway/") {
+				if seenGateways[wl.Workload.Uid] {
+					continue
 				}
-				wlInfo := s.createSplitHorizonWorkload(localizedSvc, gw)
-				if wlInfo != nil {
-					workloads = append(workloads, *wlInfo)
-				}
+				seenGateways[wl.Workload.Uid] = true
 			}
+			workloads = append(workloads, *wl)
 		}
 	}
 
 	return services, workloads
+}
+
+// buildShardProjection computes the derived services and workloads for a single
+// shard. This is the expensive path: it clones protos, adds local network VIPs,
+// and constructs split-horizon and gateway workloads.
+func (s *federationStore) buildShardProjection(shard *clusterShard, localNetwork string) *shardProjection {
+	proj := &shardProjection{}
+
+	// Create a NetworkGateway workload for this shard's gateway.
+	if shard.NetworkGateway != nil {
+		gwWorkload := s.createNetworkGatewayWorkload(shard.NetworkGateway)
+		if gwWorkload != nil {
+			proj.Workloads = append(proj.Workloads, *gwWorkload)
+		}
+	}
+
+	for _, svc := range shard.Services {
+		if svc == nil || svc.Service == nil {
+			continue
+		}
+
+		// Add local network VIPs to the service so ztunnel can find it.
+		localizedSvc := s.addLocalNetworkVIPs(svc, localNetwork)
+		proj.Services = append(proj.Services, *localizedSvc)
+
+		// Create split-horizon workloads for services that have a network gateway.
+		if shard.NetworkGateway != nil {
+			gw := model.NetworkGateway{
+				Network:   network.ID(shard.NetworkGateway.Network),
+				Cluster:   cluster.ID(shard.NetworkGateway.Cluster),
+				Addr:      shard.NetworkGateway.Addr,
+				HBONEPort: shard.NetworkGateway.HBONEPort,
+				ServiceAccount: types.NamespacedName{
+					Name:      shard.NetworkGateway.ServiceAccount,
+					Namespace: shard.NetworkGateway.Namespace,
+				},
+			}
+			wlInfo := s.createSplitHorizonWorkload(localizedSvc, gw)
+			if wlInfo != nil {
+				proj.Workloads = append(proj.Workloads, *wlInfo)
+			}
+		}
+	}
+
+	return proj
 }
 
 // createSplitHorizonWorkload creates a synthetic workload that routes to a network gateway.

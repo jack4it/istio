@@ -377,3 +377,141 @@ func TestGatewayDedupeKey_DifferentClustersNotCollapsed(t *testing.T) {
 	// Both clusters should produce distinct gateway workloads.
 	assert.Equal(t, gwCount, 2)
 }
+
+func TestProjectionCache_HitOnUnchangedShard(t *testing.T) {
+	t.Parallel()
+
+	store := newTestStore("local")
+
+	// Seed a shard.
+	store.handleSyncMessage(makeSyncMessage("cluster-remote", 1000, true,
+		"svc1.ns1.svc.cluster.local", "svc2.ns1.svc.cluster.local"))
+
+	// First call builds the cache (miss).
+	svcs1, wls1 := store.getFederationState()
+	assert.Equal(t, len(svcs1), 2)
+	assert.Equal(t, len(wls1) > 0, true)
+
+	// Verify cache was populated.
+	store.mu.RLock()
+	cached := store.shards["cluster-remote"].cachedProjection
+	store.mu.RUnlock()
+	assert.Equal(t, cached != nil, true)
+
+	// Second call should hit the cache — same results.
+	svcs2, wls2 := store.getFederationState()
+	assert.Equal(t, len(svcs2), len(svcs1))
+	assert.Equal(t, len(wls2), len(wls1))
+
+	// Verify the same projection pointer was reused (cache hit).
+	store.mu.RLock()
+	cachedAfter := store.shards["cluster-remote"].cachedProjection
+	store.mu.RUnlock()
+	assert.Equal(t, cached, cachedAfter)
+}
+
+func TestProjectionCache_InvalidatedOnNewMessage(t *testing.T) {
+	t.Parallel()
+
+	store := newTestStore("local")
+
+	// Seed and build cache.
+	store.handleSyncMessage(makeSyncMessage("cluster-remote", 1000, true,
+		"svc1.ns1.svc.cluster.local"))
+	svcs1, _ := store.getFederationState()
+	assert.Equal(t, len(svcs1), 1)
+
+	// Capture first projection.
+	store.mu.RLock()
+	firstProj := store.shards["cluster-remote"].cachedProjection
+	store.mu.RUnlock()
+	assert.Equal(t, firstProj != nil, true)
+
+	// Send a new message (incremental, adds a service). This should invalidate the cache.
+	store.handleSyncMessage(makeSyncMessage("cluster-remote", 1001, false,
+		"svc2.ns1.svc.cluster.local"))
+
+	// Cache should be nil.
+	store.mu.RLock()
+	assert.Equal(t, store.shards["cluster-remote"].cachedProjection == nil, true)
+	store.mu.RUnlock()
+
+	// Next getFederationState rebuilds the cache.
+	svcs2, _ := store.getFederationState()
+	assert.Equal(t, len(svcs2), 2)
+
+	// New projection should be different from the first.
+	store.mu.RLock()
+	secondProj := store.shards["cluster-remote"].cachedProjection
+	store.mu.RUnlock()
+	assert.Equal(t, secondProj != nil, true)
+	assert.Equal(t, firstProj != secondProj, true)
+}
+
+func TestProjectionCache_InvalidatedOnExpiry(t *testing.T) {
+	t.Parallel()
+
+	store := newTestStore("local")
+
+	// Seed and build cache.
+	store.handleSyncMessage(makeSyncMessage("cluster-remote", 1000, true,
+		"svc1.ns1.svc.cluster.local"))
+	store.getFederationState()
+
+	store.mu.RLock()
+	assert.Equal(t, store.shards["cluster-remote"].cachedProjection != nil, true)
+	store.mu.RUnlock()
+
+	// Tombstone via expiry.
+	store.mu.Lock()
+	store.shards["cluster-remote"].LastSeen = time.Now().Add(-20 * time.Minute)
+	store.mu.Unlock()
+	expired := store.expireStaleShards(10*time.Minute, time.Now())
+	assert.Equal(t, len(expired), 1)
+
+	// Cache should be cleared.
+	store.mu.RLock()
+	assert.Equal(t, store.shards["cluster-remote"].cachedProjection == nil, true)
+	store.mu.RUnlock()
+
+	// getFederationState should return nothing (tombstoned).
+	svcs, _ := store.getFederationState()
+	assert.Equal(t, len(svcs), 0)
+}
+
+func TestProjectionCache_MultiShardSelectiveInvalidation(t *testing.T) {
+	t.Parallel()
+
+	store := newTestStore("local")
+
+	// Seed two shards.
+	store.handleSyncMessage(makeSyncMessage("cluster-a", 1000, true,
+		"svc-a.ns1.svc.cluster.local"))
+	store.handleSyncMessage(makeSyncMessage("cluster-b", 1000, true,
+		"svc-b.ns1.svc.cluster.local"))
+
+	// Build caches.
+	store.getFederationState()
+
+	store.mu.RLock()
+	projA := store.shards["cluster-a"].cachedProjection
+	projB := store.shards["cluster-b"].cachedProjection
+	store.mu.RUnlock()
+	assert.Equal(t, projA != nil, true)
+	assert.Equal(t, projB != nil, true)
+
+	// Update only cluster-a.
+	store.handleSyncMessage(makeSyncMessage("cluster-a", 1001, false,
+		"svc-a2.ns1.svc.cluster.local"))
+
+	// cluster-a cache invalidated, cluster-b still valid.
+	store.mu.RLock()
+	assert.Equal(t, store.shards["cluster-a"].cachedProjection == nil, true)
+	assert.Equal(t, store.shards["cluster-b"].cachedProjection, projB) // same pointer
+	store.mu.RUnlock()
+
+	// Rebuild and verify counts.
+	svcs, _ := store.getFederationState()
+	// cluster-a: svc-a + svc-a2 = 2, cluster-b: svc-b = 1 → total 3
+	assert.Equal(t, len(svcs), 3)
+}

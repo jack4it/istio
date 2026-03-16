@@ -97,6 +97,16 @@ var (
 		"Whether this replica is the federation leader (1) or not (0).",
 	)
 
+	projectionCacheHits = monitoring.NewSum(
+		"pilot_federation_projection_cache_hits_total",
+		"Total shard projection cache hits during federation flush.",
+	)
+
+	projectionCacheMisses = monitoring.NewSum(
+		"pilot_federation_projection_cache_misses_total",
+		"Total shard projection cache misses (rebuilds) during federation flush.",
+	)
+
 	// --- Distributions ---
 
 	messageSizeBytes = monitoring.NewDistribution(

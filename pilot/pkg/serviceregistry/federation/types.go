@@ -105,6 +105,17 @@ type WireNetworkGateway struct {
 	Namespace string `json:"namespace,omitempty"`
 }
 
+// shardProjection holds the derived services and workloads for a single
+// cluster shard. It is computed once from the shard's raw data and cached
+// until the shard is mutated (new sync message, expiry, or resurrection).
+type shardProjection struct {
+	// Services are the localized services derived from this shard.
+	Services []model.ServiceInfo
+
+	// Workloads are the split-horizon + gateway workloads derived from this shard.
+	Workloads []model.WorkloadInfo
+}
+
 // clusterShard holds the synchronized state from a remote cluster.
 type clusterShard struct {
 	// ClusterID identifies the remote cluster.
@@ -130,6 +141,11 @@ type clusterShard struct {
 	// Resurrection depends on the invariant that version values are time-based
 	// (millis since epoch), so a new leader always produces higher versions.
 	Tombstoned bool
+
+	// cachedProjection holds the pre-computed derived services and workloads
+	// for this shard. Nil means the cache is invalidated and must be rebuilt.
+	// Set to nil on every mutation (sync message, expiry, resurrection).
+	cachedProjection *shardProjection
 }
 
 // ToWireServiceInfo converts a model.ServiceInfo to wire format.
