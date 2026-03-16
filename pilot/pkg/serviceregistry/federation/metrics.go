@@ -107,6 +107,11 @@ var (
 		"Total shard projection cache misses (rebuilds) during federation flush.",
 	)
 
+	transportConnected = monitoring.NewGauge(
+		"pilot_federation_transport_connected",
+		"Whether the Service Bus transport is connected (1) or not (0).",
+	)
+
 	// --- Distributions ---
 
 	messageSizeBytes = monitoring.NewDistribution(

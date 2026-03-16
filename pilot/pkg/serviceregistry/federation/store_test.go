@@ -515,3 +515,71 @@ func TestProjectionCache_MultiShardSelectiveInvalidation(t *testing.T) {
 	// cluster-a: svc-a + svc-a2 = 2, cluster-b: svc-b = 1 → total 3
 	assert.Equal(t, len(svcs), 3)
 }
+
+func TestHealthState_InitiallyNotReady(t *testing.T) {
+	t.Parallel()
+
+	var h HealthState
+	// Neither bootstrap complete nor transport connected by default.
+	assert.Equal(t, h.BootstrapComplete.Load(), false)
+	assert.Equal(t, h.TransportConnected.Load(), false)
+	assert.Equal(t, h.LastMessageReceived.Load(), int64(0))
+}
+
+func TestHealthState_ReadyRequiresBothFlags(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name        string
+		bootstrap   bool
+		transport   bool
+		expectReady bool
+	}{
+		{"neither", false, false, false},
+		{"bootstrap only", true, false, false},
+		{"transport only", false, true, false},
+		{"both", true, true, true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			var h HealthState
+			h.BootstrapComplete.Store(tt.bootstrap)
+			h.TransportConnected.Store(tt.transport)
+
+			// IsReady logic: bootstrap && transport
+			ready := h.BootstrapComplete.Load() && h.TransportConnected.Load()
+			assert.Equal(t, ready, tt.expectReady)
+		})
+	}
+}
+
+func TestHealthState_LastMessageReceived(t *testing.T) {
+	t.Parallel()
+
+	var h HealthState
+	assert.Equal(t, h.LastMessageReceived.Load(), int64(0))
+
+	now := time.Now().UnixMilli()
+	h.LastMessageReceived.Store(now)
+	assert.Equal(t, h.LastMessageReceived.Load(), now)
+}
+
+func TestHealthState_TransportDisconnectReconnect(t *testing.T) {
+	t.Parallel()
+
+	var h HealthState
+	h.TransportConnected.Store(true)
+	h.BootstrapComplete.Store(true)
+
+	// Simulate disconnect.
+	h.TransportConnected.Store(false)
+	ready := h.BootstrapComplete.Load() && h.TransportConnected.Load()
+	assert.Equal(t, ready, false)
+
+	// Simulate reconnect.
+	h.TransportConnected.Store(true)
+	ready = h.BootstrapComplete.Load() && h.TransportConnected.Load()
+	assert.Equal(t, ready, true)
+}

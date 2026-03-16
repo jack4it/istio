@@ -80,6 +80,10 @@ type ServiceBusTransport struct {
 
 	// bootstrapBatchSize is how many messages to request per batch during drain.
 	bootstrapBatchSize int
+
+	// healthState is a pointer to the SyncProtocol's HealthState.
+	// Set before Start() is called. Used to report transport connectivity.
+	healthState *HealthState
 }
 
 // ServiceBusConfig contains configuration for the Service Bus transport.
@@ -605,10 +609,15 @@ func (t *ServiceBusTransport) sendMessage(msg *SyncMessage) error {
 	return nil
 }
 
+// consecutiveErrorThreshold is the number of consecutive non-timeout receive
+// errors after which the transport reports itself as disconnected.
+const consecutiveErrorThreshold = 10
+
 // receiveLoop continuously receives messages from the subscription.
 // Messages are deserialized and forwarded to the messageHandler.
 // Failed messages are dead-lettered for investigation.
 func (t *ServiceBusTransport) receiveLoop() {
+	consecutiveErrors := 0
 	for {
 		select {
 		case <-t.stopCh:
@@ -630,9 +639,28 @@ func (t *ServiceBusTransport) receiveLoop() {
 			if errors.Is(err, context.DeadlineExceeded) {
 				continue // normal timeout, retry immediately
 			}
+			consecutiveErrors++
+			if consecutiveErrors == consecutiveErrorThreshold {
+				sbLog.Warnf("Transport disconnected after %d consecutive errors", consecutiveErrors)
+				if t.healthState != nil {
+					t.healthState.TransportConnected.Store(false)
+					transportConnected.Record(0)
+				}
+			}
 			sbLog.Warnf("Receive error (will retry): %v", err)
 			time.Sleep(time.Second)
 			continue
+		}
+
+		if consecutiveErrors >= consecutiveErrorThreshold {
+			sbLog.Infof("Transport reconnected after %d consecutive errors", consecutiveErrors)
+		}
+		if consecutiveErrors > 0 || !t.healthState.TransportConnected.Load() {
+			consecutiveErrors = 0
+			if t.healthState != nil {
+				t.healthState.TransportConnected.Store(true)
+				transportConnected.Record(1)
+			}
 		}
 
 		for _, m := range messages {

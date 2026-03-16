@@ -65,6 +65,22 @@ func runWithRecovery(name string, fn func()) {
 	}
 }
 
+// HealthState tracks the health of the federation subsystem.
+// All fields are safe for concurrent access.
+type HealthState struct {
+	// BootstrapComplete is true once the bootstrap drain finishes.
+	BootstrapComplete atomic.Bool
+
+	// TransportConnected is true while the receive loop is actively
+	// receiving messages. Set false after consecutive receive errors
+	// exceed the threshold; set true on first successful receive.
+	TransportConnected atomic.Bool
+
+	// LastMessageReceived is the wallclock time of the last successfully
+	// processed inbound message (unix millis). Zero means none received.
+	LastMessageReceived atomic.Int64
+}
+
 // SyncProtocol handles the synchronization protocol between istiod peers.
 // It broadcasts local service changes via Service Bus and processes incoming messages.
 type SyncProtocol struct {
@@ -73,6 +89,9 @@ type SyncProtocol struct {
 
 	// transport handles message delivery via Azure Service Bus.
 	transport *ServiceBusTransport
+
+	// health tracks the federation subsystem's health for readiness probes.
+	health HealthState
 
 	// localClusterID is the local cluster's ID.
 	localClusterID cluster.ID
@@ -279,7 +298,16 @@ func NewSyncProtocol(cfg SyncProtocolConfig) (*SyncProtocol, error) {
 		sp.handleIncomingMessage(msg)
 	})
 
+	// Share health state with the transport so it can report connectivity.
+	cfg.Transport.healthState = &sp.health
+
 	return sp, nil
+}
+
+// IsReady reports whether federation is healthy enough for the pod to be
+// considered ready. True once bootstrap completes AND the transport is connected.
+func (sp *SyncProtocol) IsReady() bool {
+	return sp.health.BootstrapComplete.Load() && sp.health.TransportConnected.Load()
 }
 
 // Start begins federation messaging and registers for service change events.
@@ -301,6 +329,8 @@ func (sp *SyncProtocol) Start() error {
 	if err := sp.transport.Start(); err != nil {
 		return fmt.Errorf("failed to start transport: %w", err)
 	}
+	sp.health.TransportConnected.Store(true)
+	transportConnected.Record(1)
 	syncLog.Info("Transport started")
 
 	// 2. Start inbound message processor (all replicas)
@@ -337,6 +367,17 @@ func (sp *SyncProtocol) Start() error {
 	}
 
 	syncLog.Info("Sync protocol started (awaiting leader election for outbound publishing)")
+
+	// Wait for bootstrap in a background goroutine and mark health.
+	go func() {
+		select {
+		case <-sp.transport.BootstrapDone():
+			sp.health.BootstrapComplete.Store(true)
+			syncLog.Info("Health: bootstrap complete")
+		case <-sp.stopCh:
+		}
+	}()
+
 	return nil
 }
 
@@ -659,6 +700,7 @@ func (sp *SyncProtocol) processIncomingDebounced() {
 		count := 0
 		if gotMessage {
 			count = 1
+			sp.health.LastMessageReceived.Store(time.Now().UnixMilli())
 		}
 
 		// Start debounce timers.
@@ -672,6 +714,7 @@ func (sp *SyncProtocol) processIncomingDebounced() {
 			case msg := <-sp.incomingCh:
 				sp.store.handleSyncMessage(msg)
 				count++
+				sp.health.LastMessageReceived.Store(time.Now().UnixMilli())
 				if !quietTimer.Stop() {
 					<-quietTimer.C
 				}

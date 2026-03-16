@@ -91,6 +91,9 @@ func (s *Server) initFederationSync(args *PilotArgs, serviceControllers *aggrega
 		return fmt.Errorf("failed to create sync protocol: %w", err)
 	}
 
+	// Register health/readiness probe so Kubernetes can detect federation failures.
+	s.addReadinessProbe("federation", syncProtocol.IsReady)
+
 	// Start the sync protocol (transport + inbound processing on all replicas)
 	s.addStartFunc("federation registry", func(stop <-chan struct{}) error {
 		go func() {
