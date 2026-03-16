@@ -27,6 +27,7 @@ import (
 	"github.com/Azure/azure-sdk-for-go/sdk/messaging/azservicebus/admin"
 
 	"istio.io/istio/pilot/pkg/model"
+	"istio.io/istio/pilot/pkg/util/runtime"
 	"istio.io/istio/pkg/cluster"
 	"istio.io/istio/pkg/log"
 )
@@ -200,6 +201,7 @@ func NewServiceBusTransport(cfg ServiceBusConfig) (*ServiceBusTransport, error) 
 	// Service Bus RPCs (send, receive, peek, ack) are cancelled on shutdown.
 	stopCtx, stopCancel := context.WithCancel(context.Background())
 	go func() {
+		defer runtime.HandleCrash(runtime.LogPanic)
 		select {
 		case <-cfg.StopCh:
 			stopCancel()

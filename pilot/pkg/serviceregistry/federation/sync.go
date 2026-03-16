@@ -20,6 +20,7 @@ import (
 	"time"
 
 	"istio.io/istio/pilot/pkg/model"
+	"istio.io/istio/pilot/pkg/util/runtime"
 	"istio.io/istio/pkg/cluster"
 	"istio.io/istio/pkg/kube/krt"
 	"istio.io/istio/pkg/log"
@@ -39,6 +40,29 @@ const (
 )
 
 var syncLog = log.RegisterScope("federation-sync", "Federation sync protocol")
+
+// runWithRecovery runs fn, recovering from panics and restarting with a brief
+// backoff. This ensures critical federation goroutines are not silently lost.
+// If fn returns normally (e.g. stopCh closed), runWithRecovery returns.
+func runWithRecovery(name string, fn func()) {
+	for {
+		recovered := false
+		func() {
+			defer func() {
+				if r := recover(); r != nil {
+					runtime.LogPanic(r)
+					syncLog.Errorf("federation goroutine %q panicked, restarting after backoff", name)
+					recovered = true
+				}
+			}()
+			fn()
+		}()
+		if !recovered {
+			return
+		}
+		time.Sleep(1 * time.Second)
+	}
+}
 
 // SyncProtocol handles the synchronization protocol between istiod peers.
 // It broadcasts local service changes via Service Bus and processes incoming messages.
@@ -279,12 +303,12 @@ func (sp *SyncProtocol) Start() error {
 	syncLog.Info("Transport started")
 
 	// 2. Start inbound message processor (all replicas)
-	go sp.processIncomingDebounced()
+	go runWithRecovery("processIncomingDebounced", sp.processIncomingDebounced)
 
 	// 3. Start shard expiry sweep (all replicas — every replica serves
 	// federated state to ztunnel/envoy and must independently expire dead shards)
 	if sp.shardExpiry > 0 {
-		go sp.shardExpiryLoop()
+		go runWithRecovery("shardExpiryLoop", sp.shardExpiryLoop)
 	}
 
 	// Get ambient index — may be nil if not yet available or not enabled
@@ -335,15 +359,16 @@ func (sp *SyncProtocol) BecomeLeader(leaderStop <-chan struct{}) {
 	syncLog.Info("This replica is now the federation leader — starting outbound publishing")
 
 	// Start the outgoing debounce loop (drains outgoingCh → broadcast)
-	go sp.processOutgoingDebounced()
+	go runWithRecovery("processOutgoingDebounced", sp.processOutgoingDebounced)
 
 	// Start the snapshot loop (periodic full sync publish)
 	if sp.snapshotInterval > 0 {
-		go sp.snapshotLoop()
+		go runWithRecovery("snapshotLoop", sp.snapshotLoop)
 	}
 
 	// Bridge the external leaderStop to our internal leaderStopCh
 	go func() {
+		defer runtime.HandleCrash(runtime.LogPanic)
 		select {
 		case <-leaderStop:
 			sp.StopLeading()
