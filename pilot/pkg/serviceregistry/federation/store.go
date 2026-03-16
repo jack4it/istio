@@ -117,6 +117,7 @@ func (s *federationStore) handleSyncMessage(msg *SyncMessage) {
 		if !(msg.FullSync && remoteVersion == localVersion && !s.isShardTombstoned(clusterID)) {
 			storeLog.Debugf("Ignoring stale message from cluster %s (remote=%d, local=%d, tombstoned=%v)",
 				clusterID, remoteVersion, localVersion, s.isShardTombstoned(clusterID))
+			messagesDroppedStale.Increment()
 			return
 		}
 	}
@@ -131,6 +132,7 @@ func (s *federationStore) handleSyncMessage(msg *SyncMessage) {
 		if shard != nil && shard.Tombstoned {
 			storeLog.Infof("Resurrecting tombstoned cluster %s with version %d (was %d)",
 				clusterID, remoteVersion, shard.Version)
+			shardsResurrected.Increment()
 		}
 		shard = &clusterShard{
 			ClusterID: clusterID,
@@ -219,9 +221,26 @@ func (s *federationStore) expireStaleShards(expiry time.Duration, now time.Time)
 			shard.Services = nil
 			shard.NetworkGateway = nil
 			expired = append(expired, cid)
+			shardsExpired.Increment()
 		}
 	}
 	return expired
+}
+
+// recordShardGauges updates the live/tombstoned shard gauge metrics.
+func (s *federationStore) recordShardGauges() {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	var live, tombstoned int
+	for _, shard := range s.shards {
+		if shard.Tombstoned {
+			tombstoned++
+		} else {
+			live++
+		}
+	}
+	shardsLive.Record(float64(live))
+	shardsTombstoned.Record(float64(tombstoned))
 }
 
 // getFederationState returns all services and workloads from the federation store.

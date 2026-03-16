@@ -52,6 +52,7 @@ func runWithRecovery(name string, fn func()) {
 				if r := recover(); r != nil {
 					runtime.LogPanic(r)
 					syncLog.Errorf("federation goroutine %q panicked, restarting after backoff", name)
+					panicsRecovered.With(goroutineTag.Value(name)).Increment()
 					recovered = true
 				}
 			}()
@@ -357,6 +358,7 @@ func (sp *SyncProtocol) BecomeLeader(leaderStop <-chan struct{}) {
 	sp.leaderStopCh = make(chan struct{})
 	sp.isLeader.Store(true)
 	syncLog.Info("This replica is now the federation leader — starting outbound publishing")
+	isLeader.Record(1)
 
 	// Start the outgoing debounce loop (drains outgoingCh → broadcast)
 	go runWithRecovery("processOutgoingDebounced", sp.processOutgoingDebounced)
@@ -384,6 +386,7 @@ func (sp *SyncProtocol) StopLeading() {
 		return
 	}
 	syncLog.Info("This replica lost federation leadership — stopping outbound publishing")
+	isLeader.Record(0)
 	close(sp.leaderStopCh)
 }
 
@@ -429,6 +432,9 @@ func (sp *SyncProtocol) publishSnapshot() {
 		return
 	}
 	sp.broadcast(msg)
+	if msg.FullSync {
+		messagesSentFullSync.Increment()
+	}
 	syncLog.Infof("Published full-sync snapshot: %d services", len(msg.Services))
 }
 
@@ -436,6 +442,7 @@ func (sp *SyncProtocol) publishSnapshot() {
 func (sp *SyncProtocol) broadcast(msg *SyncMessage) {
 	if err := sp.transport.Broadcast(msg); err != nil {
 		syncLog.Warnf("Failed to broadcast message: %v", err)
+		broadcastErrors.Increment()
 	}
 }
 
@@ -614,6 +621,11 @@ func (sp *SyncProtocol) processOutgoingDebounced() {
 		}
 
 		sp.broadcast(msg)
+		if msg.FullSync {
+			messagesSentFullSync.Increment()
+		} else {
+			messagesSentIncremental.Increment()
+		}
 		syncLog.Infof("Flushed debounced outgoing broadcast: %d services, %d deletes, version=%d",
 			len(services), len(deletedHostnames), version)
 	}
@@ -687,9 +699,16 @@ func (sp *SyncProtocol) processIncomingDebounced() {
 		}
 
 		// Single batch update: rebuild KRT collections and trigger one XDS push.
+		flushStart := time.Now()
 		services, workloads := sp.store.getFederationState()
 		sp.federationServices.Reset(services)
 		sp.federationWorkloads.Reset(workloads)
+		flushDurationInbound.Record(time.Since(flushStart).Seconds())
+
+		// Update state gauges.
+		federatedServices.Record(float64(len(services)))
+		federatedWorkloads.Record(float64(len(workloads)))
+		sp.store.recordShardGauges()
 		// No manual XDS push needed: krt's reactive pipeline propagates
 		// collection changes through JoinCollection → indexes → RegisterBatch
 		// → XDS push automatically.

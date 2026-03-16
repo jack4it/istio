@@ -280,6 +280,8 @@ func (t *ServiceBusTransport) BootstrapDone() <-chan struct{} {
 
 // bootstrapThenReceive runs the two-phase startup sequence.
 func (t *ServiceBusTransport) bootstrapThenReceive() {
+	bootstrapStart := time.Now()
+
 	// Peek from the shared bootstrap subscription. This subscription is never
 	// actively consumed — messages accumulate and expire via TTL. Peek is
 	// non-destructive, so all replicas can peek simultaneously.
@@ -300,6 +302,7 @@ func (t *ServiceBusTransport) bootstrapThenReceive() {
 	}
 
 	close(t.bootstrapDone)
+	bootstrapDuration.Record(time.Since(bootstrapStart).Seconds())
 	sbLog.Info("Bootstrap complete, switching to live receive loop")
 	t.receiveLoop()
 }
@@ -595,6 +598,8 @@ func (t *ServiceBusTransport) sendMessage(msg *SyncMessage) error {
 		return fmt.Errorf("send to Service Bus: %w", err)
 	}
 
+	messageSizeBytesOutbound.Record(float64(len(data)))
+
 	sbLog.Debugf("Published %d services (fullSync=%v, size=%d bytes) to topic %s",
 		len(msg.Services), msg.FullSync, len(data), t.topicName)
 	return nil
@@ -641,6 +646,7 @@ func (t *ServiceBusTransport) processMessage(m *azservicebus.ReceivedMessage) {
 	var syncMsg SyncMessage
 	if err := json.Unmarshal(m.Body, &syncMsg); err != nil {
 		sbLog.Warnf("Failed to unmarshal message (dead-lettering): %v", err)
+		messagesDroppedUnmarshalError.Increment()
 		dlCtx, dlCancel := context.WithTimeout(t.stopCtx, 5*time.Second)
 		defer dlCancel()
 		if dlErr := t.receiver.DeadLetterMessage(dlCtx, m, nil); dlErr != nil {
@@ -659,6 +665,13 @@ func (t *ServiceBusTransport) processMessage(m *azservicebus.ReceivedMessage) {
 
 	sbLog.Debugf("Received sync from cluster %s: %d services, fullSync=%v",
 		syncMsg.ClusterID, len(syncMsg.Services), syncMsg.FullSync)
+
+	messageSizeBytesInbound.Record(float64(len(m.Body)))
+	if syncMsg.FullSync {
+		messagesReceivedFullSync.Increment()
+	} else {
+		messagesReceivedIncremental.Increment()
+	}
 
 	t.messageHandler(&syncMsg)
 
