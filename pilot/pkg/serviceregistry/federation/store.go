@@ -239,7 +239,10 @@ func (s *federationStore) getFederationState() ([]model.ServiceInfo, []model.Wor
 	var services []model.ServiceInfo
 	var workloads []model.WorkloadInfo
 
-	// Track which gateways we've already created workloads for
+	// Track which gateways we've already created workloads for.
+	// Key includes network, address, port, and cluster to avoid collapsing
+	// two remote clusters that share a network and gateway address but have
+	// different HBONE ports or identities.
 	seenGateways := make(map[string]bool)
 
 	for _, shard := range s.shards {
@@ -251,7 +254,9 @@ func (s *federationStore) getFederationState() ([]model.ServiceInfo, []model.Wor
 		// This is needed so ztunnel knows how to reach the remote gateway
 		// when routing traffic to split-horizon workloads.
 		if shard.NetworkGateway != nil {
-			gwKey := shard.NetworkGateway.Network + "/" + shard.NetworkGateway.Addr
+			gwKey := fmt.Sprintf("%s/%s/%d/%s",
+				shard.NetworkGateway.Network, shard.NetworkGateway.Addr,
+				shard.NetworkGateway.HBONEPort, shard.ClusterID)
 			if !seenGateways[gwKey] {
 				seenGateways[gwKey] = true
 				gwWorkload := s.createNetworkGatewayWorkload(shard.NetworkGateway)

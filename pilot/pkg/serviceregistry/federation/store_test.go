@@ -312,3 +312,68 @@ func TestNewSyncProtocol_RejectsExpiryWithDisabledSnapshots(t *testing.T) {
 	})
 	assert.Equal(t, err != nil, true)
 }
+
+func TestGatewayDedupeKey_DifferentClustersNotCollapsed(t *testing.T) {
+	t.Parallel()
+
+	store := newTestStore("local")
+
+	// Two clusters on the same network with the same gateway address
+	// but different HBONE ports and cluster IDs.
+	msgA := &SyncMessage{
+		ClusterID:     "cluster-a",
+		FullSync:      true,
+		VersionVector: map[cluster.ID]uint64{"cluster-a": 1000},
+		NetworkGateway: &WireNetworkGateway{
+			Network:   "network-shared",
+			Cluster:   "cluster-a",
+			Addr:      "10.0.0.1",
+			HBONEPort: 15008,
+		},
+		Services: []model.ServiceInfo{{
+			Service: &workloadapi.Service{
+				Hostname:  "svc-a.ns1.svc.cluster.local",
+				Namespace: "ns1",
+				Addresses: []*workloadapi.NetworkAddress{{Network: "network-shared", Address: []byte{10, 0, 0, 1}}},
+				Ports:     []*workloadapi.Port{{ServicePort: 80, TargetPort: 8080}},
+			},
+			Scope: model.Global,
+		}},
+	}
+
+	msgB := &SyncMessage{
+		ClusterID:     "cluster-b",
+		FullSync:      true,
+		VersionVector: map[cluster.ID]uint64{"cluster-b": 1000},
+		NetworkGateway: &WireNetworkGateway{
+			Network:   "network-shared",
+			Cluster:   "cluster-b",
+			Addr:      "10.0.0.1",
+			HBONEPort: 15009, // different port
+		},
+		Services: []model.ServiceInfo{{
+			Service: &workloadapi.Service{
+				Hostname:  "svc-b.ns1.svc.cluster.local",
+				Namespace: "ns1",
+				Addresses: []*workloadapi.NetworkAddress{{Network: "network-shared", Address: []byte{10, 0, 0, 2}}},
+				Ports:     []*workloadapi.Port{{ServicePort: 80, TargetPort: 8080}},
+			},
+			Scope: model.Global,
+		}},
+	}
+
+	store.handleSyncMessage(msgA)
+	store.handleSyncMessage(msgB)
+
+	_, workloads := store.getFederationState()
+
+	// Count gateway workloads (UIDs starting with "NetworkGateway/").
+	gwCount := 0
+	for _, wl := range workloads {
+		if wl.Workload != nil && len(wl.Workload.Uid) > 15 && wl.Workload.Uid[:15] == "NetworkGateway/" {
+			gwCount++
+		}
+	}
+	// Both clusters should produce distinct gateway workloads.
+	assert.Equal(t, gwCount, 2)
+}
