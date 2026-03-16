@@ -286,20 +286,17 @@ func (t *ServiceBusTransport) BootstrapDone() <-chan struct{} {
 func (t *ServiceBusTransport) bootstrapThenReceive() {
 	bootstrapStart := time.Now()
 
-	// Peek from the shared bootstrap subscription. This subscription is never
-	// actively consumed — messages accumulate and expire via TTL. Peek is
-	// non-destructive, so all replicas can peek simultaneously.
-	sbLog.Infof("Phase 1: peeking retained messages from bootstrap subscription %s", t.bootstrapSubscriptionName)
-	retained := t.peekBootstrapMessages()
+	// Peek from the shared bootstrap subscription and merge inline.
+	// Messages are folded into per-cluster state as they are peeked,
+	// so superseded snapshots become unreferenced immediately rather
+	// than accumulating in memory.
+	sbLog.Infof("Peeking retained messages from bootstrap subscription %s", t.bootstrapSubscriptionName)
+	merged, totalPeeked := t.peekBootstrapMessages()
 
-	sbLog.Infof("Phase 1 complete: %d retained messages", len(retained))
-
-	// Merge retained messages: keep only the latest full-sync per cluster,
-	// discard superseded snapshots and stale incrementals.
-	merged := mergeBootstrapMessages(retained)
+	sbLog.Infof("Bootstrap peek complete: %d peeked, %d after merge", totalPeeked, len(merged))
 
 	if len(merged) > 0 {
-		sbLog.Infof("Phase 2: applying merged state from %d messages", len(merged))
+		sbLog.Infof("Applying merged bootstrap state from %d messages", len(merged))
 		for _, msg := range merged {
 			t.messageHandler(msg)
 		}
@@ -311,17 +308,20 @@ func (t *ServiceBusTransport) bootstrapThenReceive() {
 	t.receiveLoop()
 }
 
-// peekBootstrapMessages reads all retained messages from the shared bootstrap
-// subscription using non-destructive peek. Per-replica subscriptions are freshly
-// created and have no retained messages, so bootstrap state is loaded by peeking
-// this shared subscription.
-func (t *ServiceBusTransport) peekBootstrapMessages() []*SyncMessage {
+// peekBootstrapMessages reads retained messages from the shared bootstrap
+// subscription using non-destructive peek and merges them inline. Each peeked
+// message is immediately folded into a per-cluster merger, so superseded
+// snapshots become unreferenced and GC-eligible without accumulating in a
+// large intermediate slice.
+//
+// Returns the merged messages and the total number of messages peeked.
+func (t *ServiceBusTransport) peekBootstrapMessages() (merged []*SyncMessage, totalPeeked int) {
 	// Create a temporary receiver for the bootstrap subscription (peek only)
 	bootstrapReceiver, err := t.client.NewReceiverForSubscription(t.topicName, t.bootstrapSubscriptionName, nil)
 	if err != nil {
 		sbLog.Warnf("Failed to create bootstrap receiver for subscription %s, starting with empty state: %v",
 			t.bootstrapSubscriptionName, err)
-		return nil
+		return nil, 0
 	}
 	defer func() {
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
@@ -329,13 +329,13 @@ func (t *ServiceBusTransport) peekBootstrapMessages() []*SyncMessage {
 		bootstrapReceiver.Close(ctx)
 	}()
 
-	var allMessages []*SyncMessage
+	var merger bootstrapMerger
 	fromSeqNum := int64(0)
 
 	for {
 		select {
 		case <-t.stopCh:
-			return allMessages
+			return merger.result(), totalPeeked
 		default:
 		}
 
@@ -347,7 +347,7 @@ func (t *ServiceBusTransport) peekBootstrapMessages() []*SyncMessage {
 
 		if err != nil {
 			if ctx.Err() == nil {
-				sbLog.Warnf("Error during bootstrap peek, proceeding with %d messages: %v", len(allMessages), err)
+				sbLog.Warnf("Error during bootstrap peek, proceeding with %d merged messages: %v", merger.messageCount(), err)
 			}
 			break
 		}
@@ -384,7 +384,10 @@ func (t *ServiceBusTransport) peekBootstrapMessages() []*SyncMessage {
 				}
 			}
 
-			allMessages = append(allMessages, &syncMsg)
+			// Fold into merger immediately — superseded messages become
+			// unreferenced and eligible for GC.
+			merger.add(&syncMsg)
+			totalPeeked++
 
 			// Advance sequence number for next peek batch
 			if m.SequenceNumber != nil && *m.SequenceNumber >= fromSeqNum {
@@ -393,64 +396,84 @@ func (t *ServiceBusTransport) peekBootstrapMessages() []*SyncMessage {
 		}
 	}
 
-	sbLog.Infof("Peeked %d messages from bootstrap subscription %s", len(allMessages), t.bootstrapSubscriptionName)
-	return allMessages
+	sbLog.Infof("Peeked %d messages from bootstrap subscription %s, %d after merge",
+		totalPeeked, t.bootstrapSubscriptionName, merger.messageCount())
+	return merger.result(), totalPeeked
 }
 
-// mergeBootstrapMessages reduces a list of retained messages to the minimal
-// set needed to reconstruct the latest state from each source cluster.
-//
-// For each cluster:
+// bootstrapMerger accumulates SyncMessages and keeps only the minimal set
+// needed to reconstruct state for each source cluster. Superseded messages
+// (older full-syncs, stale incrementals) are discarded immediately, keeping
+// memory proportional to the final merged state rather than the total peek
+// volume.
+type bootstrapMerger struct {
+	byCluster map[cluster.ID]*mergerClusterState
+}
+
+type mergerClusterState struct {
+	latestFullSync    *SyncMessage
+	fullSyncVersion   uint64
+	incrementalsAfter []*SyncMessage
+}
+
+// add folds a message into the per-cluster state. For each cluster:
 //   - The latest full-sync snapshot is kept (highest version wins)
 //   - All older full syncs are discarded
 //   - Incrementals older than the latest full sync are discarded
 //   - Incrementals newer than the latest full sync are kept
-//
-// The result is ordered: each cluster's full sync first, then newer incrementals.
-// This ensures the store's version vector merge produces the correct final state.
-func mergeBootstrapMessages(messages []*SyncMessage) []*SyncMessage {
-	type clusterState struct {
-		latestFullSync    *SyncMessage
-		fullSyncVersion   uint64
-		incrementalsAfter []*SyncMessage
+func (m *bootstrapMerger) add(msg *SyncMessage) {
+	if m.byCluster == nil {
+		m.byCluster = make(map[cluster.ID]*mergerClusterState)
 	}
 
-	byCluster := make(map[cluster.ID]*clusterState)
-
-	for _, msg := range messages {
-		cid := msg.ClusterID
-		state, ok := byCluster[cid]
-		if !ok {
-			state = &clusterState{}
-			byCluster[cid] = state
-		}
-
-		version := msg.VersionVector[cid]
-
-		if msg.FullSync {
-			if version >= state.fullSyncVersion {
-				state.latestFullSync = msg
-				state.fullSyncVersion = version
-				// Incrementals before this full sync are superseded.
-				state.incrementalsAfter = nil
-			}
-		} else {
-			if version > state.fullSyncVersion {
-				state.incrementalsAfter = append(state.incrementalsAfter, msg)
-			}
-			// Incrementals at or below the full sync version are stale, skip them.
-		}
+	cid := msg.ClusterID
+	state, ok := m.byCluster[cid]
+	if !ok {
+		state = &mergerClusterState{}
+		m.byCluster[cid] = state
 	}
 
+	version := msg.VersionVector[cid]
+
+	if msg.FullSync {
+		if version >= state.fullSyncVersion {
+			state.latestFullSync = msg
+			state.fullSyncVersion = version
+			// Incrementals before this full sync are superseded.
+			state.incrementalsAfter = nil
+		}
+	} else {
+		if version > state.fullSyncVersion {
+			state.incrementalsAfter = append(state.incrementalsAfter, msg)
+		}
+		// Incrementals at or below the full sync version are stale, skip them.
+	}
+}
+
+// result returns the merged messages ordered: each cluster's full sync first,
+// then newer incrementals. This ensures the store's version vector merge
+// produces the correct final state.
+func (m *bootstrapMerger) result() []*SyncMessage {
 	var result []*SyncMessage
-	for _, state := range byCluster {
+	for _, state := range m.byCluster {
 		if state.latestFullSync != nil {
 			result = append(result, state.latestFullSync)
 		}
 		result = append(result, state.incrementalsAfter...)
 	}
-
 	return result
+}
+
+// messageCount returns the number of messages currently retained in the merger.
+func (m *bootstrapMerger) messageCount() int {
+	n := 0
+	for _, state := range m.byCluster {
+		if state.latestFullSync != nil {
+			n++
+		}
+		n += len(state.incrementalsAfter)
+	}
+	return n
 }
 
 func (t *ServiceBusTransport) Broadcast(msg *SyncMessage) error {

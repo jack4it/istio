@@ -583,3 +583,169 @@ func TestHealthState_TransportDisconnectReconnect(t *testing.T) {
 	ready = h.BootstrapComplete.Load() && h.TransportConnected.Load()
 	assert.Equal(t, ready, true)
 }
+
+// --- bootstrapMerger tests ---
+
+func makeBootstrapMsg(clusterID cluster.ID, version uint64, fullSync bool, hostnames ...string) *SyncMessage {
+	msg := &SyncMessage{
+		ClusterID:     clusterID,
+		FullSync:      fullSync,
+		VersionVector: map[cluster.ID]uint64{clusterID: version},
+	}
+	for _, h := range hostnames {
+		msg.Services = append(msg.Services, model.ServiceInfo{
+			Service: &workloadapi.Service{
+				Hostname: h,
+			},
+		})
+	}
+	return msg
+}
+
+func TestBootstrapMerger_EmptyInput(t *testing.T) {
+	t.Parallel()
+
+	var m bootstrapMerger
+	result := m.result()
+	assert.Equal(t, len(result), 0)
+	assert.Equal(t, m.messageCount(), 0)
+}
+
+func TestBootstrapMerger_SingleFullSync(t *testing.T) {
+	t.Parallel()
+
+	var m bootstrapMerger
+	msg := makeBootstrapMsg("cluster-a", 1, true, "svc1.ns.svc.cluster.local")
+	m.add(msg)
+
+	result := m.result()
+	assert.Equal(t, len(result), 1)
+	assert.Equal(t, result[0], msg)
+	assert.Equal(t, m.messageCount(), 1)
+}
+
+func TestBootstrapMerger_SupersededFullSync(t *testing.T) {
+	t.Parallel()
+
+	var m bootstrapMerger
+	old := makeBootstrapMsg("cluster-a", 1, true, "svc-old.ns.svc.cluster.local")
+	newer := makeBootstrapMsg("cluster-a", 5, true, "svc-new.ns.svc.cluster.local")
+
+	m.add(old)
+	m.add(newer)
+
+	result := m.result()
+	assert.Equal(t, len(result), 1)
+	assert.Equal(t, result[0], newer)
+	assert.Equal(t, m.messageCount(), 1)
+}
+
+func TestBootstrapMerger_FullSyncPlusNewerIncrementals(t *testing.T) {
+	t.Parallel()
+
+	var m bootstrapMerger
+	full := makeBootstrapMsg("cluster-a", 3, true, "svc1.ns.svc.cluster.local")
+	inc := makeBootstrapMsg("cluster-a", 4, false, "svc2.ns.svc.cluster.local")
+
+	m.add(full)
+	m.add(inc)
+
+	result := m.result()
+	assert.Equal(t, len(result), 2)
+	assert.Equal(t, m.messageCount(), 2)
+}
+
+func TestBootstrapMerger_StaleIncrementalDiscarded(t *testing.T) {
+	t.Parallel()
+
+	var m bootstrapMerger
+	full := makeBootstrapMsg("cluster-a", 5, true, "svc1.ns.svc.cluster.local")
+	staleInc := makeBootstrapMsg("cluster-a", 3, false, "svc-old.ns.svc.cluster.local")
+
+	m.add(full)
+	m.add(staleInc)
+
+	result := m.result()
+	assert.Equal(t, len(result), 1)
+	assert.Equal(t, result[0], full)
+}
+
+func TestBootstrapMerger_NewFullSyncClearsIncrementals(t *testing.T) {
+	t.Parallel()
+
+	var m bootstrapMerger
+	oldFull := makeBootstrapMsg("cluster-a", 2, true, "svc1.ns.svc.cluster.local")
+	inc := makeBootstrapMsg("cluster-a", 3, false, "svc2.ns.svc.cluster.local")
+	newFull := makeBootstrapMsg("cluster-a", 5, true, "svc3.ns.svc.cluster.local")
+
+	m.add(oldFull)
+	m.add(inc)
+	m.add(newFull)
+
+	// The newer full sync supersedes both the old full sync and the incremental.
+	result := m.result()
+	assert.Equal(t, len(result), 1)
+	assert.Equal(t, result[0], newFull)
+}
+
+func TestBootstrapMerger_MultipleClusters(t *testing.T) {
+	t.Parallel()
+
+	var m bootstrapMerger
+	msgA := makeBootstrapMsg("cluster-a", 1, true, "svc-a.ns.svc.cluster.local")
+	msgB := makeBootstrapMsg("cluster-b", 1, true, "svc-b.ns.svc.cluster.local")
+	msgC := makeBootstrapMsg("cluster-c", 3, true, "svc-c.ns.svc.cluster.local")
+
+	m.add(msgA)
+	m.add(msgB)
+	m.add(msgC)
+
+	result := m.result()
+	assert.Equal(t, len(result), 3)
+	assert.Equal(t, m.messageCount(), 3)
+}
+
+func TestBootstrapMerger_IncrementalsOnlyNoFullSync(t *testing.T) {
+	t.Parallel()
+
+	// If there's no full sync for a cluster, incrementals are kept since
+	// fullSyncVersion defaults to 0 and any version > 0 passes the filter.
+	var m bootstrapMerger
+	inc1 := makeBootstrapMsg("cluster-a", 1, false, "svc1.ns.svc.cluster.local")
+	inc2 := makeBootstrapMsg("cluster-a", 2, false, "svc2.ns.svc.cluster.local")
+
+	m.add(inc1)
+	m.add(inc2)
+
+	result := m.result()
+	assert.Equal(t, len(result), 2)
+	assert.Equal(t, m.messageCount(), 2)
+}
+
+func TestBootstrapMerger_MixedFullSyncAndIncremental(t *testing.T) {
+	t.Parallel()
+
+	var m bootstrapMerger
+	old := makeBootstrapMsg("cluster-a", 1, true, "svc-old.ns.svc.cluster.local")
+	newer := makeBootstrapMsg("cluster-a", 5, true, "svc-new.ns.svc.cluster.local")
+	inc := makeBootstrapMsg("cluster-a", 6, false, "svc-inc.ns.svc.cluster.local")
+
+	m.add(old)
+	m.add(newer)
+	m.add(inc)
+
+	result := m.result()
+	assert.Equal(t, len(result), 2)
+
+	var foundFull, foundInc bool
+	for _, msg := range result {
+		if msg.FullSync && msg.VersionVector["cluster-a"] == 5 {
+			foundFull = true
+		}
+		if !msg.FullSync && msg.VersionVector["cluster-a"] == 6 {
+			foundInc = true
+		}
+	}
+	assert.Equal(t, foundFull, true)
+	assert.Equal(t, foundInc, true)
+}
