@@ -288,13 +288,6 @@ func (a *index) buildGlobalCollections(
 			[]krt.Collection[model.ServiceInfo]{GlobalMergedWorkloadServices, fedSvcs},
 			opts.WithName("GlobalMergedWithFederationServices")...,
 		)
-
-		fedSvcs.RegisterBatch(krt.BatchedEventFilter(
-			func(a model.ServiceInfo) *workloadapi.Service {
-				return a.Service
-			},
-			PushXdsAddress(a.XDSUpdater, model.ServiceInfo.ResourceName),
-		), false)
 	}
 
 	GobalWorkloadServicesWithClusterByCluster := nestedCollectionIndexByCluster(GlobalWorkloadServicesWithCluster)
@@ -446,15 +439,10 @@ func (a *index) buildGlobalCollections(
 	// The federation store already produces properly formed split-horizon workloads
 	// (with gateway routing, correct UIDs, network gateway entries) so they bypass
 	// the coalescence pipeline which requires k8s-discovered network gateways.
+	// No direct RegisterBatch handler needed — the SplitHorizonWorkloads handler
+	// below covers federation workload changes via KRT's reactive pipeline.
 	if fedWls != nil {
 		splitHorizonComponents = append(splitHorizonComponents, fedWls)
-
-		fedWls.RegisterBatch(krt.BatchedEventFilter(
-			func(a model.WorkloadInfo) *workloadapi.Workload {
-				return a.Workload
-			},
-			PushXdsAddress(a.XDSUpdater, model.WorkloadInfo.ResourceName),
-		), false)
 	}
 
 	SplitHorizonWorkloads := krt.JoinCollection(
