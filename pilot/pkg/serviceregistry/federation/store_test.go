@@ -749,3 +749,483 @@ func TestBootstrapMerger_MixedFullSyncAndIncremental(t *testing.T) {
 	assert.Equal(t, foundFull, true)
 	assert.Equal(t, foundInc, true)
 }
+
+// --- Version vector / temporal semantics tests ---
+
+func TestVersionVector_StaleMessageRejected(t *testing.T) {
+	t.Parallel()
+
+	store := newTestStore("local")
+
+	// Accept version 5.
+	store.handleSyncMessage(makeSyncMessage("cluster-a", 5, true, "svc1.ns1.svc.cluster.local"))
+	svcs, _ := store.getFederationState()
+	assert.Equal(t, len(svcs), 1)
+
+	// Reject version 3 (stale).
+	store.handleSyncMessage(makeSyncMessage("cluster-a", 3, true, "svc-stale.ns1.svc.cluster.local"))
+	svcs, _ = store.getFederationState()
+	assert.Equal(t, len(svcs), 1)
+	assert.Equal(t, svcs[0].Service.Hostname, "svc1.ns1.svc.cluster.local")
+}
+
+func TestVersionVector_EqualVersionFullSyncAccepted(t *testing.T) {
+	t.Parallel()
+
+	store := newTestStore("local")
+
+	// Accept version 5 full-sync.
+	store.handleSyncMessage(makeSyncMessage("cluster-a", 5, true, "svc1.ns1.svc.cluster.local"))
+
+	// Equal version full-sync (re-delivery) — accepted for idempotency.
+	store.handleSyncMessage(makeSyncMessage("cluster-a", 5, true, "svc-updated.ns1.svc.cluster.local"))
+	svcs, _ := store.getFederationState()
+	assert.Equal(t, len(svcs), 1)
+	assert.Equal(t, svcs[0].Service.Hostname, "svc-updated.ns1.svc.cluster.local")
+}
+
+func TestVersionVector_EqualVersionIncrementalRejected(t *testing.T) {
+	t.Parallel()
+
+	store := newTestStore("local")
+
+	// Accept version 5.
+	store.handleSyncMessage(makeSyncMessage("cluster-a", 5, true, "svc1.ns1.svc.cluster.local"))
+
+	// Equal version incremental — rejected (only full-sync re-delivery accepted).
+	store.handleSyncMessage(makeSyncMessage("cluster-a", 5, false, "svc-inc.ns1.svc.cluster.local"))
+	svcs, _ := store.getFederationState()
+	assert.Equal(t, len(svcs), 1)
+	assert.Equal(t, svcs[0].Service.Hostname, "svc1.ns1.svc.cluster.local")
+}
+
+func TestVersionVector_OutOfOrderDelivery(t *testing.T) {
+	t.Parallel()
+
+	store := newTestStore("local")
+
+	// Messages arrive out of order: 3, 1, 5, 2.
+	store.handleSyncMessage(makeSyncMessage("cluster-a", 3, true, "svc-v3.ns1.svc.cluster.local"))
+	store.handleSyncMessage(makeSyncMessage("cluster-a", 1, true, "svc-v1.ns1.svc.cluster.local"))
+	store.handleSyncMessage(makeSyncMessage("cluster-a", 5, true, "svc-v5.ns1.svc.cluster.local"))
+	store.handleSyncMessage(makeSyncMessage("cluster-a", 2, true, "svc-v2.ns1.svc.cluster.local"))
+
+	// Only the highest version (5) should be retained.
+	svcs, _ := store.getFederationState()
+	assert.Equal(t, len(svcs), 1)
+	assert.Equal(t, svcs[0].Service.Hostname, "svc-v5.ns1.svc.cluster.local")
+}
+
+func TestVersionVector_MultiClusterIndependent(t *testing.T) {
+	t.Parallel()
+
+	store := newTestStore("local")
+
+	// Two clusters with their own version vectors.
+	store.handleSyncMessage(makeSyncMessage("cluster-a", 10, true, "svc-a.ns1.svc.cluster.local"))
+	store.handleSyncMessage(makeSyncMessage("cluster-b", 5, true, "svc-b.ns1.svc.cluster.local"))
+
+	// Stale message for cluster-a doesn't affect cluster-b.
+	store.handleSyncMessage(makeSyncMessage("cluster-a", 3, true, "svc-stale.ns1.svc.cluster.local"))
+
+	svcs, _ := store.getFederationState()
+	assert.Equal(t, len(svcs), 2)
+
+	hostnames := make(map[string]bool)
+	for _, svc := range svcs {
+		hostnames[svc.Service.Hostname] = true
+	}
+	assert.Equal(t, hostnames["svc-a.ns1.svc.cluster.local"], true)
+	assert.Equal(t, hostnames["svc-b.ns1.svc.cluster.local"], true)
+}
+
+// --- Full-sync replacement semantics tests ---
+
+func TestFullSync_ReplacesEntireShard(t *testing.T) {
+	t.Parallel()
+
+	store := newTestStore("local")
+
+	// Version 1: two services.
+	msg1 := makeSyncMessage("cluster-a", 1, true, "svc1.ns1.svc.cluster.local", "svc2.ns1.svc.cluster.local")
+	store.handleSyncMessage(msg1)
+	svcs, _ := store.getFederationState()
+	assert.Equal(t, len(svcs), 2)
+
+	// Version 2: full-sync replaces with one different service.
+	msg2 := makeSyncMessage("cluster-a", 2, true, "svc3.ns1.svc.cluster.local")
+	store.handleSyncMessage(msg2)
+	svcs, _ = store.getFederationState()
+	assert.Equal(t, len(svcs), 1)
+	assert.Equal(t, svcs[0].Service.Hostname, "svc3.ns1.svc.cluster.local")
+}
+
+// --- Incremental delete semantics tests ---
+
+func TestIncrementalDelete_RemovesService(t *testing.T) {
+	t.Parallel()
+
+	store := newTestStore("local")
+
+	// Full-sync with two services.
+	store.handleSyncMessage(makeSyncMessage("cluster-a", 1, true,
+		"svc1.ns1.svc.cluster.local", "svc2.ns1.svc.cluster.local"))
+	svcs, _ := store.getFederationState()
+	assert.Equal(t, len(svcs), 2)
+
+	// Incremental delete of svc1.
+	deleteMsg := &SyncMessage{
+		ClusterID:        "cluster-a",
+		FullSync:         false,
+		VersionVector:    map[cluster.ID]uint64{"cluster-a": 2},
+		DeletedHostnames: []string{"svc1.ns1.svc.cluster.local"},
+	}
+	store.handleSyncMessage(deleteMsg)
+
+	svcs, _ = store.getFederationState()
+	assert.Equal(t, len(svcs), 1)
+	assert.Equal(t, svcs[0].Service.Hostname, "svc2.ns1.svc.cluster.local")
+}
+
+func TestIncrementalDelete_NonexistentHostnameIgnored(t *testing.T) {
+	t.Parallel()
+
+	store := newTestStore("local")
+
+	store.handleSyncMessage(makeSyncMessage("cluster-a", 1, true, "svc1.ns1.svc.cluster.local"))
+
+	// Delete a hostname that doesn't exist — no crash, no effect.
+	deleteMsg := &SyncMessage{
+		ClusterID:        "cluster-a",
+		FullSync:         false,
+		VersionVector:    map[cluster.ID]uint64{"cluster-a": 2},
+		DeletedHostnames: []string{"nonexistent.ns1.svc.cluster.local"},
+	}
+	store.handleSyncMessage(deleteMsg)
+
+	svcs, _ := store.getFederationState()
+	assert.Equal(t, len(svcs), 1)
+}
+
+func TestIncrementalAddAndDelete_SameMessage(t *testing.T) {
+	t.Parallel()
+
+	store := newTestStore("local")
+
+	store.handleSyncMessage(makeSyncMessage("cluster-a", 1, true,
+		"svc1.ns1.svc.cluster.local", "svc2.ns1.svc.cluster.local"))
+
+	// Incremental: add svc3, delete svc1. Deletes are processed before adds.
+	msg := makeSyncMessage("cluster-a", 2, false, "svc3.ns1.svc.cluster.local")
+	msg.DeletedHostnames = []string{"svc1.ns1.svc.cluster.local"}
+	store.handleSyncMessage(msg)
+
+	svcs, _ := store.getFederationState()
+	assert.Equal(t, len(svcs), 2)
+	hostnames := make(map[string]bool)
+	for _, svc := range svcs {
+		hostnames[svc.Service.Hostname] = true
+	}
+	assert.Equal(t, hostnames["svc2.ns1.svc.cluster.local"], true)
+	assert.Equal(t, hostnames["svc3.ns1.svc.cluster.local"], true)
+}
+
+// --- Self-message filtering tests ---
+
+func TestSelfMessage_Ignored(t *testing.T) {
+	t.Parallel()
+
+	store := newTestStore("local-cluster")
+
+	// Message from own cluster — should be silently dropped.
+	store.handleSyncMessage(makeSyncMessage("local-cluster", 1, true, "svc1.ns1.svc.cluster.local"))
+
+	svcs, _ := store.getFederationState()
+	assert.Equal(t, len(svcs), 0)
+}
+
+// --- Nil / empty message safety tests ---
+
+func TestNilMessage_Ignored(t *testing.T) {
+	t.Parallel()
+
+	store := newTestStore("local")
+
+	// Should not panic.
+	store.handleSyncMessage(nil)
+
+	svcs, _ := store.getFederationState()
+	assert.Equal(t, len(svcs), 0)
+}
+
+func TestEmptyFullSync_ClearsShard(t *testing.T) {
+	t.Parallel()
+
+	store := newTestStore("local")
+
+	// Populate shard.
+	store.handleSyncMessage(makeSyncMessage("cluster-a", 1, true,
+		"svc1.ns1.svc.cluster.local", "svc2.ns1.svc.cluster.local"))
+	svcs, _ := store.getFederationState()
+	assert.Equal(t, len(svcs), 2)
+
+	// Empty full-sync replaces shard with zero services.
+	store.handleSyncMessage(makeSyncMessage("cluster-a", 2, true))
+	svcs, _ = store.getFederationState()
+	assert.Equal(t, len(svcs), 0)
+}
+
+// --- Multi-cluster convergence tests ---
+
+func TestConvergence_BootstrapThenIncrementals(t *testing.T) {
+	t.Parallel()
+
+	store := newTestStore("local")
+
+	// Simulate bootstrap: full-sync from two clusters.
+	store.handleSyncMessage(makeSyncMessage("cluster-a", 100, true,
+		"svc-a1.ns1.svc.cluster.local", "svc-a2.ns1.svc.cluster.local"))
+	store.handleSyncMessage(makeSyncMessage("cluster-b", 50, true,
+		"svc-b1.ns1.svc.cluster.local"))
+
+	// Live incrementals: cluster-a adds a service, cluster-b deletes one.
+	store.handleSyncMessage(makeSyncMessage("cluster-a", 101, false, "svc-a3.ns1.svc.cluster.local"))
+
+	deleteMsgB := &SyncMessage{
+		ClusterID:        "cluster-b",
+		FullSync:         false,
+		VersionVector:    map[cluster.ID]uint64{"cluster-b": 51},
+		DeletedHostnames: []string{"svc-b1.ns1.svc.cluster.local"},
+	}
+	store.handleSyncMessage(deleteMsgB)
+
+	svcs, _ := store.getFederationState()
+	assert.Equal(t, len(svcs), 3) // a1, a2, a3; b1 deleted
+
+	hostnames := make(map[string]bool)
+	for _, svc := range svcs {
+		hostnames[svc.Service.Hostname] = true
+	}
+	assert.Equal(t, hostnames["svc-a1.ns1.svc.cluster.local"], true)
+	assert.Equal(t, hostnames["svc-a2.ns1.svc.cluster.local"], true)
+	assert.Equal(t, hostnames["svc-a3.ns1.svc.cluster.local"], true)
+	assert.Equal(t, hostnames["svc-b1.ns1.svc.cluster.local"], false)
+}
+
+func TestConvergence_FullSyncHealsStaleState(t *testing.T) {
+	t.Parallel()
+
+	store := newTestStore("local")
+
+	// Initial state: svc1 and svc2.
+	store.handleSyncMessage(makeSyncMessage("cluster-a", 1, true,
+		"svc1.ns1.svc.cluster.local", "svc2.ns1.svc.cluster.local"))
+
+	// Suppose we missed an incremental delete for svc1.
+	// The next full-sync at version 5 heals the state.
+	store.handleSyncMessage(makeSyncMessage("cluster-a", 5, true, "svc2.ns1.svc.cluster.local"))
+
+	svcs, _ := store.getFederationState()
+	assert.Equal(t, len(svcs), 1)
+	assert.Equal(t, svcs[0].Service.Hostname, "svc2.ns1.svc.cluster.local")
+}
+
+func TestConvergence_TombstoneBlocksRetainedBootstrapMessages(t *testing.T) {
+	t.Parallel()
+
+	store := newTestStore("local")
+
+	// Accept initial state at version 10.
+	store.handleSyncMessage(makeSyncMessage("cluster-a", 10, true, "svc1.ns1.svc.cluster.local"))
+
+	// Tombstone the shard.
+	store.mu.Lock()
+	store.shards["cluster-a"].LastSeen = time.Now().Add(-20 * time.Minute)
+	store.mu.Unlock()
+	store.expireStaleShards(15*time.Minute, time.Now())
+
+	// Retained bootstrap re-delivers the version 10 full-sync — should be blocked.
+	store.handleSyncMessage(makeSyncMessage("cluster-a", 10, true, "svc1.ns1.svc.cluster.local"))
+
+	svcs, _ := store.getFederationState()
+	assert.Equal(t, len(svcs), 0)
+
+	// Only a strictly newer version can resurrect.
+	store.handleSyncMessage(makeSyncMessage("cluster-a", 11, true, "svc-resurrected.ns1.svc.cluster.local"))
+	svcs, _ = store.getFederationState()
+	assert.Equal(t, len(svcs), 1)
+	assert.Equal(t, svcs[0].Service.Hostname, "svc-resurrected.ns1.svc.cluster.local")
+}
+
+// --- SPIFFE SAN parsing tests ---
+
+func TestParseSpiffeSAN_ValidSAN(t *testing.T) {
+	t.Parallel()
+
+	result := parseSpiffeSAN("spiffe://cluster.local/ns/my-ns/sa/my-sa")
+	assert.Equal(t, result != nil, true)
+	assert.Equal(t, result.namespace, "my-ns")
+	assert.Equal(t, result.serviceAccount, "my-sa")
+}
+
+func TestParseSpiffeSAN_DifferentTrustDomain(t *testing.T) {
+	t.Parallel()
+
+	result := parseSpiffeSAN("spiffe://example.com/ns/prod/sa/web-server")
+	assert.Equal(t, result != nil, true)
+	assert.Equal(t, result.namespace, "prod")
+	assert.Equal(t, result.serviceAccount, "web-server")
+}
+
+func TestParseSpiffeSAN_InvalidFormats(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name string
+		san  string
+	}{
+		{"empty", ""},
+		{"not spiffe", "https://example.com/ns/foo/sa/bar"},
+		{"no path", "spiffe://cluster.local"},
+		{"missing sa segment", "spiffe://cluster.local/ns/my-ns"},
+		{"wrong prefix", "spiffe://cluster.local/foo/my-ns/sa/my-sa"},
+		{"wrong middle", "spiffe://cluster.local/ns/my-ns/notsa/my-sa"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			assert.Equal(t, parseSpiffeSAN(tt.san) == nil, true)
+		})
+	}
+}
+
+// --- Split-horizon workload identity tests ---
+
+func TestSplitHorizonWorkload_ExtractsFirstSAN(t *testing.T) {
+	t.Parallel()
+
+	store := newTestStore("local")
+
+	msg := makeSyncMessage("cluster-a", 1, true, "svc1.ns1.svc.cluster.local")
+	// Add SANs to the service.
+	msg.Services[0].Service.SubjectAltNames = []string{
+		"spiffe://cluster.local/ns/ns1/sa/primary-sa",
+		"spiffe://cluster.local/ns/ns1/sa/secondary-sa",
+	}
+	store.handleSyncMessage(msg)
+
+	_, wls := store.getFederationState()
+
+	// Find the split-horizon workload (not the gateway).
+	var splitHorizonWl *model.WorkloadInfo
+	for i := range wls {
+		if !isGatewayWorkload(&wls[i]) {
+			splitHorizonWl = &wls[i]
+			break
+		}
+	}
+	assert.Equal(t, splitHorizonWl != nil, true)
+	// Only the first SAN's service account is used.
+	assert.Equal(t, splitHorizonWl.Workload.ServiceAccount, "primary-sa")
+}
+
+func TestSplitHorizonWorkload_NoSANDefaultsToDefault(t *testing.T) {
+	t.Parallel()
+
+	store := newTestStore("local")
+
+	msg := makeSyncMessage("cluster-a", 1, true, "svc1.ns1.svc.cluster.local")
+	// No SANs.
+	msg.Services[0].Service.SubjectAltNames = nil
+	store.handleSyncMessage(msg)
+
+	_, wls := store.getFederationState()
+
+	var splitHorizonWl *model.WorkloadInfo
+	for i := range wls {
+		if !isGatewayWorkload(&wls[i]) {
+			splitHorizonWl = &wls[i]
+			break
+		}
+	}
+	assert.Equal(t, splitHorizonWl != nil, true)
+	assert.Equal(t, splitHorizonWl.Workload.ServiceAccount, "default")
+}
+
+// --- Gateway workload tests ---
+
+func TestGatewayWorkload_CreatedPerShard(t *testing.T) {
+	t.Parallel()
+
+	store := newTestStore("local")
+
+	store.handleSyncMessage(makeSyncMessage("cluster-a", 1, true, "svc1.ns1.svc.cluster.local"))
+
+	_, wls := store.getFederationState()
+
+	var gatewayCount int
+	for i := range wls {
+		if isGatewayWorkload(&wls[i]) {
+			gatewayCount++
+		}
+	}
+	assert.Equal(t, gatewayCount, 1)
+}
+
+func TestGatewayWorkload_NoGatewayNoWorkloads(t *testing.T) {
+	t.Parallel()
+
+	store := newTestStore("local")
+
+	msg := &SyncMessage{
+		ClusterID:     "cluster-a",
+		FullSync:      true,
+		VersionVector: map[cluster.ID]uint64{"cluster-a": 1},
+		// No NetworkGateway.
+		Services: []model.ServiceInfo{{
+			Service: &workloadapi.Service{
+				Hostname:  "svc1.ns1.svc.cluster.local",
+				Namespace: "ns1",
+				Addresses: []*workloadapi.NetworkAddress{{Network: "net-a", Address: []byte{10, 0, 0, 1}}},
+				Ports:     []*workloadapi.Port{{ServicePort: 80}},
+			},
+			Scope: model.Global,
+		}},
+	}
+	store.handleSyncMessage(msg)
+
+	_, wls := store.getFederationState()
+	assert.Equal(t, len(wls), 0)
+}
+
+// --- Channel pressure tests ---
+
+func TestIncomingChannel_DropsOnOverflow(t *testing.T) {
+	t.Parallel()
+
+	// The incoming channel has capacity 100. Verify that sending beyond
+	// capacity uses non-blocking semantics and does not deadlock.
+	ch := make(chan *SyncMessage, 100)
+
+	// Fill the channel.
+	for i := range 100 {
+		ch <- makeSyncMessage("cluster-a", uint64(i), false, "svc.ns1.svc.cluster.local")
+	}
+
+	// One more — this should NOT block (matches handleIncomingMessage behavior).
+	select {
+	case ch <- makeSyncMessage("cluster-a", 200, false, "svc.ns1.svc.cluster.local"):
+		// If we got here, the channel wasn't full (unexpected).
+		t.Fatal("expected channel to be full")
+	default:
+		// Expected: channel full, message dropped.
+	}
+
+	assert.Equal(t, len(ch), 100)
+}
+
+// isGatewayWorkload returns true if the workload UID indicates a NetworkGateway workload.
+func isGatewayWorkload(wl *model.WorkloadInfo) bool {
+	return len(wl.Workload.Uid) > 15 && wl.Workload.Uid[:15] == "NetworkGateway/"
+}
