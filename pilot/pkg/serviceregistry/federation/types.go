@@ -118,6 +118,18 @@ type clusterShard struct {
 
 	// NetworkGateway is the network gateway info for this cluster.
 	NetworkGateway *WireNetworkGateway
+
+	// LastSeen is the time the last accepted message from this cluster was processed.
+	// Used by the expiry sweep to detect dead clusters.
+	LastSeen time.Time
+
+	// Tombstoned is true when this shard has been expired due to prolonged silence.
+	// A tombstoned shard retains its Version so that stale messages (including
+	// retained full-sync snapshots) cannot resurrect a dead cluster. Only a
+	// message with a strictly newer version can clear the tombstone.
+	// Resurrection depends on the invariant that version values are time-based
+	// (millis since epoch), so a new leader always produces higher versions.
+	Tombstoned bool
 }
 
 // ToWireServiceInfo converts a model.ServiceInfo to wire format.

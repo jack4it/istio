@@ -95,6 +95,18 @@ type SyncProtocol struct {
 	// Re-created each time leadership is acquired.
 	leaderStopCh chan struct{}
 
+	// maintenanceCh is used by the periodic sweep loop to signal the
+	// inbound debounce loop that an expiry check should be performed.
+	// Capacity 1; non-blocking sends ensure the sweep never blocks.
+	maintenanceCh chan struct{}
+
+	// shardExpiry is the duration after which a shard with no accepted
+	// messages is tombstoned. Zero disables expiry.
+	shardExpiry time.Duration
+
+	// shardSweepInterval is how often to check for expired shards.
+	shardSweepInterval time.Duration
+
 	// stopCh signals shutdown.
 	stopCh chan struct{}
 }
@@ -141,6 +153,15 @@ type SyncProtocolConfig struct {
 	// Transport is the Service Bus transport for federation messaging.
 	Transport *ServiceBusTransport
 
+	// ShardExpiry is the duration after which a shard with no accepted
+	// messages is tombstoned and its services/workloads removed.
+	// Defaults to max(3*SnapshotInterval, 15m) if zero. Set negative to disable.
+	ShardExpiry time.Duration
+
+	// ShardSweepInterval is how often to check for expired shards.
+	// Defaults to 1m if zero.
+	ShardSweepInterval time.Duration
+
 	StopCh chan struct{}
 }
 
@@ -183,6 +204,32 @@ func NewSyncProtocol(cfg SyncProtocolConfig) (*SyncProtocol, error) {
 		snapshotInterval = 5 * time.Minute
 	}
 
+	// Compute shard expiry. Default: max(3*snapshotInterval, 15m).
+	// This gives headroom for publish jitter, election turnover, and
+	// transient Service Bus hiccups.
+	shardExpiry := cfg.ShardExpiry
+	if shardExpiry == 0 {
+		shardExpiry = 3 * snapshotInterval
+		if shardExpiry < 15*time.Minute {
+			shardExpiry = 15 * time.Minute
+		}
+	}
+	if shardExpiry < 0 {
+		shardExpiry = 0 // disabled
+	}
+
+	// If shard expiry is enabled, a positive snapshot interval is required.
+	// Without periodic snapshots, remote clusters have no heartbeat signal
+	// and every peer will eventually tombstone this cluster's shard.
+	if shardExpiry > 0 && snapshotInterval < 0 {
+		return nil, fmt.Errorf("shard expiry (%v) requires a positive SnapshotInterval; got %v", shardExpiry, snapshotInterval)
+	}
+
+	shardSweepInterval := cfg.ShardSweepInterval
+	if shardSweepInterval == 0 {
+		shardSweepInterval = 1 * time.Minute
+	}
+
 	sp := &SyncProtocol{
 		store:                     store,
 		localClusterID:            cfg.LocalClusterID,
@@ -192,8 +239,11 @@ func NewSyncProtocol(cfg SyncProtocolConfig) (*SyncProtocol, error) {
 		federationWorkloads:       federationWorkloads,
 		localNetworkGatewayGetter: cfg.LocalNetworkGatewayGetter,
 		snapshotInterval:          snapshotInterval,
+		shardExpiry:               shardExpiry,
+		shardSweepInterval:        shardSweepInterval,
 		incomingCh:                make(chan *SyncMessage, 100),
 		outgoingCh:                make(chan outgoingEvent, 100),
+		maintenanceCh:             make(chan struct{}, 1),
 		stopCh:                    cfg.StopCh,
 		transport:                 cfg.Transport,
 	}
@@ -230,6 +280,12 @@ func (sp *SyncProtocol) Start() error {
 
 	// 2. Start inbound message processor (all replicas)
 	go sp.processIncomingDebounced()
+
+	// 3. Start shard expiry sweep (all replicas — every replica serves
+	// federated state to ztunnel/envoy and must independently expire dead shards)
+	if sp.shardExpiry > 0 {
+		go sp.shardExpiryLoop()
+	}
 
 	// Get ambient index — may be nil if not yet available or not enabled
 	if sp.ambientIndexGetter != nil {
@@ -543,21 +599,30 @@ func (sp *SyncProtocol) processOutgoingDebounced() {
 // (so version vectors stay current), but defers the expensive KRT collection
 // reset and XDS push until a quiet period or max wait is reached.
 //
+// Maintenance events (shard expiry sweeps) are also handled here to ensure
+// a single serialized path owns store mutation and KRT Reset() calls.
+//
 // This provides two layers of batching:
 //  1. Federation debounce (200ms quiet / 2s max) — batches store→KRT→push
 //  2. Istiod's built-in XDS debounce (100ms/10s) — batches pushes to proxies
 func (sp *SyncProtocol) processIncomingDebounced() {
 	for {
-		// Block until first message arrives.
-		var msg *SyncMessage
+		// Block until first message or maintenance signal arrives.
+		var gotMessage bool
 		select {
-		case msg = <-sp.incomingCh:
+		case msg := <-sp.incomingCh:
+			sp.store.handleSyncMessage(msg)
+			gotMessage = true
+		case <-sp.maintenanceCh:
+			// Maintenance signal: run expiry check and flush.
 		case <-sp.stopCh:
 			return
 		}
 
-		sp.store.handleSyncMessage(msg)
-		count := 1
+		count := 0
+		if gotMessage {
+			count = 1
+		}
 
 		// Start debounce timers.
 		quietTimer := time.NewTimer(debounceAfter)
@@ -567,13 +632,15 @@ func (sp *SyncProtocol) processIncomingDebounced() {
 	drain:
 		for {
 			select {
-			case msg = <-sp.incomingCh:
+			case msg := <-sp.incomingCh:
 				sp.store.handleSyncMessage(msg)
 				count++
 				if !quietTimer.Stop() {
 					<-quietTimer.C
 				}
 				quietTimer.Reset(debounceAfter)
+			case <-sp.maintenanceCh:
+				// Coalesce maintenance signals into the current debounce window.
 			case <-quietTimer.C:
 				break drain
 			case <-maxTimer.C:
@@ -587,6 +654,13 @@ func (sp *SyncProtocol) processIncomingDebounced() {
 		quietTimer.Stop()
 		maxTimer.Stop()
 
+		// Run shard expiry check. This is cheap when nothing expires.
+		if sp.shardExpiry > 0 {
+			if expired := sp.store.expireStaleShards(sp.shardExpiry, time.Now()); len(expired) > 0 {
+				syncLog.Infof("Expired %d shard(s): %v", len(expired), expired)
+			}
+		}
+
 		// Single batch update: rebuild KRT collections and trigger one XDS push.
 		services, workloads := sp.store.getFederationState()
 		sp.federationServices.Reset(services)
@@ -597,6 +671,28 @@ func (sp *SyncProtocol) processIncomingDebounced() {
 
 		syncLog.Infof("Flushed debounced federation update: %d messages, %d services, %d workloads",
 			count, len(services), len(workloads))
+	}
+}
+
+// shardExpiryLoop periodically signals the debounce loop to run an expiry
+// check. It runs on all replicas because every replica independently serves
+// federated state to proxies and must withdraw dead clusters' contributions.
+func (sp *SyncProtocol) shardExpiryLoop() {
+	ticker := time.NewTicker(sp.shardSweepInterval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ticker.C:
+			// Non-blocking send: if the debounce loop hasn't consumed the
+			// previous signal yet, skip — it will run expiry on its next flush.
+			select {
+			case sp.maintenanceCh <- struct{}{}:
+			default:
+			}
+		case <-sp.stopCh:
+			return
+		}
 	}
 }
 

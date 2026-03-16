@@ -115,6 +115,15 @@ var (
 	ServiceBusSnapshotInterval = env.Register("PILOT_SERVICEBUS_SNAPSHOT_INTERVAL", 5*time.Minute,
 		"How often to publish a full-sync snapshot to Service Bus for cold-start bootstrap of new istiod instances.").Get()
 
+	// Shard liveness and expiry.
+
+	FederationShardExpiry = env.Register("PILOT_FEDERATION_SHARD_EXPIRY", time.Duration(0),
+		"Duration after which a remote cluster's shard is tombstoned if no accepted message has been received. "+
+			"Defaults to max(3*SnapshotInterval, 15m) when zero. Set negative to disable expiry entirely.").Get()
+
+	FederationShardSweepInterval = env.Register("PILOT_FEDERATION_SHARD_SWEEP_INTERVAL", 1*time.Minute,
+		"How often to check for expired remote cluster shards.").Get()
+
 	EnableWdsDryRunAuthzPol = registerAmbient("AMBIENT_ENABLE_DRY_RUN_AUTHORIZATION_POLICY", false, false,
 		"If enabled, ztunnel will be configured with dry-run authorizationPolicies. "+
 			"Ensure ztunnel is 1.29 or above before enabling this feature. "+

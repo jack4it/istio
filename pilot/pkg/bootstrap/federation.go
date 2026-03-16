@@ -82,6 +82,8 @@ func (s *Server) initFederationSync(args *PilotArgs, serviceControllers *aggrega
 		FederationServices:  fedSource.StaticServices(),
 		FederationWorkloads: fedSource.StaticWorkloads(),
 		SnapshotInterval:    features.ServiceBusSnapshotInterval,
+		ShardExpiry:         features.FederationShardExpiry,
+		ShardSweepInterval:  features.FederationShardSweepInterval,
 		Transport:           sbTransport,
 		StopCh:              stopCh,
 	})

@@ -19,6 +19,7 @@ import (
 	"net/netip"
 	"strings"
 	"sync"
+	"time"
 
 	"google.golang.org/protobuf/types/known/wrapperspb"
 
@@ -105,29 +106,41 @@ func (s *federationStore) handleSyncMessage(msg *SyncMessage) {
 	}
 	localVersion := s.versionVector.get(clusterID)
 
-	if !msg.FullSync && remoteVersion <= localVersion {
-		storeLog.Debugf("Ignoring stale message from cluster %s (remote=%d, local=%d)",
-			clusterID, remoteVersion, localVersion)
-		return
-	}
-
-	if msg.FullSync && remoteVersion < localVersion {
-		storeLog.Warnf("Applying full sync from cluster %s with older version (remote=%d, local=%d) — shard will be replaced",
-			clusterID, remoteVersion, localVersion)
+	// Reject messages with version <= the recorded version. This covers both
+	// normal stale-message filtering and tombstone protection: a tombstoned
+	// shard retains its version, so retained snapshots from a dead cluster
+	// cannot resurrect it. Only a strictly newer version can clear a tombstone.
+	if remoteVersion <= localVersion {
+		// Exception: allow full-sync with equal version (re-delivery of same snapshot),
+		// but NOT when the shard is tombstoned — a tombstoned shard can only be
+		// resurrected by a strictly newer version.
+		if !(msg.FullSync && remoteVersion == localVersion && !s.isShardTombstoned(clusterID)) {
+			storeLog.Debugf("Ignoring stale message from cluster %s (remote=%d, local=%d, tombstoned=%v)",
+				clusterID, remoteVersion, localVersion, s.isShardTombstoned(clusterID))
+			return
+		}
 	}
 
 	storeLog.Infof("Processing sync message from cluster %s (full=%v, version=%d, gateway=%v)",
 		clusterID, msg.FullSync, remoteVersion, msg.NetworkGateway)
 
-	// Get or create shard for this cluster
+	// Get or create shard for this cluster.
+	// If the shard exists and is tombstoned, a strictly newer version resurrects it.
 	shard, exists := s.shards[clusterID]
-	if !exists || msg.FullSync {
+	if !exists || msg.FullSync || shard.Tombstoned {
+		if shard != nil && shard.Tombstoned {
+			storeLog.Infof("Resurrecting tombstoned cluster %s with version %d (was %d)",
+				clusterID, remoteVersion, shard.Version)
+		}
 		shard = &clusterShard{
 			ClusterID: clusterID,
 			Services:  make(map[string]*model.ServiceInfo),
 		}
 		s.shards[clusterID] = shard
 	}
+
+	// Refresh liveness timestamp on every accepted message.
+	shard.LastSeen = time.Now()
 
 	// Store the network gateway info from this cluster
 	if msg.NetworkGateway != nil {
@@ -158,12 +171,57 @@ func (s *federationStore) handleSyncMessage(msg *SyncMessage) {
 	// Log current state of all shards
 	var shardSummary []string
 	for cid, sh := range s.shards {
-		shardSummary = append(shardSummary, fmt.Sprintf("%s:%d", cid, len(sh.Services)))
+		if sh.Tombstoned {
+			shardSummary = append(shardSummary, fmt.Sprintf("%s:tombstoned", cid))
+		} else {
+			shardSummary = append(shardSummary, fmt.Sprintf("%s:%d", cid, len(sh.Services)))
+		}
 	}
 	storeLog.Debugf("After sync: shards=%v", shardSummary)
+}
 
-	// Mark as synced after first full sync
-	// Note: synced state is now tracked by KRT collections, not here
+// isShardTombstoned returns whether a cluster's shard is currently tombstoned.
+// Must be called with s.mu held (read or write).
+func (s *federationStore) isShardTombstoned(clusterID cluster.ID) bool {
+	if shard, ok := s.shards[clusterID]; ok {
+		return shard.Tombstoned
+	}
+	return false
+}
+
+// expireStaleShards checks all shards and tombstones any that have not received
+// an accepted message within the given expiry duration. Tombstoned shards retain
+// their Version so that stale messages cannot resurrect them.
+// Returns the cluster IDs that were newly tombstoned (for logging/metrics).
+func (s *federationStore) expireStaleShards(expiry time.Duration, now time.Time) []cluster.ID {
+	if expiry <= 0 {
+		return nil
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	var expired []cluster.ID
+	for cid, shard := range s.shards {
+		if shard.Tombstoned {
+			continue
+		}
+		// Shards with zero LastSeen were loaded during bootstrap and have not
+		// received a live message yet. Use the shard creation as a grace period:
+		// don't expire until at least one full expiry window has passed since startup.
+		if shard.LastSeen.IsZero() {
+			continue
+		}
+		if now.Sub(shard.LastSeen) > expiry {
+			storeLog.Warnf("Tombstoning shard for cluster %s: no message in %v (last seen %v)",
+				cid, now.Sub(shard.LastSeen).Round(time.Second), shard.LastSeen.Format(time.RFC3339))
+			shard.Tombstoned = true
+			shard.Services = nil
+			shard.NetworkGateway = nil
+			expired = append(expired, cid)
+		}
+	}
+	return expired
 }
 
 // getFederationState returns all services and workloads from the federation store.
@@ -185,6 +243,10 @@ func (s *federationStore) getFederationState() ([]model.ServiceInfo, []model.Wor
 	seenGateways := make(map[string]bool)
 
 	for _, shard := range s.shards {
+		// Skip tombstoned shards — their services and gateways have been cleared.
+		if shard.Tombstoned {
+			continue
+		}
 		// Create a NetworkGateway workload for each remote gateway.
 		// This is needed so ztunnel knows how to reach the remote gateway
 		// when routing traffic to split-horizon workloads.
