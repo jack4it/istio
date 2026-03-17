@@ -146,6 +146,8 @@ federated data back to its origin cluster.
  │  │  • handleSyncMessage()             │  │
  │  │  • per-clusterID state sharding    │  │
  │  │  • version vector conflict res.    │  │
+ │  │  • shard expiry → tombstoning      │  │
+ │  │  • per-shard projection cache      │  │
  │  │  ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─  │  │
  │  │  Transforms wire services into:    │  │
  │  │  • model.ServiceInfo (+ local VIPs)│  │
@@ -154,8 +156,10 @@ federated data back to its origin cluster.
  │  └──────────────┬─────────────────────┘  │
  │                 ▼                        │
  │  ┌────────────────────────────────────┐  │
- │  │  getFederationState() → flatten    │  │
- │  │  all clusters into one slice each  │  │
+ │  │  getFederationState()              │  │
+ │  │  • per-shard projection cache      │  │
+ │  │  • cross-shard gateway dedupe      │  │
+ │  │  → flatten into svc[] + wl[]       │  │
  │  └──────────────┬─────────────────────┘  │
  └─────────────────┼────────────────────────┘
                    ▼
@@ -199,12 +203,29 @@ federated data back to its origin cluster.
                                     ┌─────────────────────────┐
                                     │  XDS Push → ztunnel     │
                                     │  (ADDRESS type updates)  │
-                                    └─────────────────────────┘
+                                    └─────────────┬───────────┘
+                                                  │
+                              ┌────────────────── ▼ ─────────────────┐
+                              │  Synthetic EDS Bridge (waypoints)    │
+                              │  (only when svc.Waypoint != nil)     │
+                              │                                      │
+                              │  SplitHorizonWorkloads               │
+                              │   → filter: remote + has services    │
+                              │   → SyntheticSplitHorizonWorkloads   │
+                              │   → index by (svc, clusterID)        │
+                              │   → IstioEndpoint[] transform        │
+                              │   → RegisterBatch → EDSUpdate()      │
+                              │   → waypoint proxy (Envoy)           │
+                              └──────────────────────────────────────┘
 ```
 
 **Key:** Federation workloads enter `SplitHorizonWorkloads` via **two paths**: merged into
 `GlobalWorkloads` (for SAN discovery by `SplitHorizonServices`) and directly appended
 (bypassing coalescence, since they already carry gateway routing).
+
+**Synthetic EDS Bridge:** Split-horizon workloads exist in workload XDS (used by ztunnel)
+but waypoint proxies still use classic Envoy EDS. The `Synthetic*` pipeline bridges the gap —
+it only fires for services with a waypoint attached (`svc.Service.Waypoint != nil`).
 
 ### Layered Design
 
@@ -239,12 +260,26 @@ Cold-start bootstrap uses a **two-phase peek-and-merge** strategy:
 - Per-replica subscriptions are freshly created and empty. Bootstrap **peeks** (non-destructive read) from the shared `federation-bootstrap` subscription, which has no SQL filter and accumulates snapshots from all clusters via TTL. Self-messages are skipped in code. All replicas across all clusters can peek simultaneously without interference.
 - **First-ever startup**: The bootstrap subscription is empty — no state to bootstrap from. This is correct; the cluster begins with no federation knowledge and discovers remote services as they publish.
 
-**Phase 1 — Peek retained messages:** The transport peeks all available messages using short timeouts (5 s). Messages are accumulated in memory without triggering XDS pushes or KRT collection updates.
+**Phase 1 — Peek retained messages:** The transport peeks all available messages from the shared bootstrap subscription using non-destructive reads with short timeouts (5 s). Messages are accumulated in a **`bootstrapMerger`** without triggering XDS pushes or KRT collection updates.
 
-**Phase 2 — Merge and Apply:** Retained messages are merged per source cluster:
+**Phase 2 — Streaming Merge and Apply:** The `bootstrapMerger` maintains per-cluster state:
+
+```go
+type bootstrapMerger struct {
+    byCluster map[cluster.ID]*mergerClusterState
+}
+type mergerClusterState struct {
+    latestFullSync    *SyncMessage      // Latest full-sync snapshot per cluster
+    fullSyncVersion   uint64            // Version of that snapshot
+    incrementalsAfter []*SyncMessage    // Incrementals newer than the full sync
+}
+```
+
+Merge rules per source cluster:
 - Only the **latest full-sync snapshot** per cluster is kept (highest version vector value)
-- Stale full syncs and superseded incrementals are discarded
-- Incrementals newer than the latest full sync are kept
+- A newer full sync **clears all accumulated incrementals** (they're superseded)
+- Stale full syncs and incrementals older than the latest full sync are discarded
+- Incrementals newer than the latest full sync are kept and ordered
 
 The merged set is delivered to the message handler in order — producing a **single XDS push cycle** rather than N pushes for N retained messages.
 
@@ -285,7 +320,7 @@ Inbound:  transport -> incomingCh -> processIncomingDebounced -> store -> KRT ->
 Outbound: ambient events -> outgoingCh -> processOutgoingDebounced -> broadcast -> transport
 ```
 
-**Inbound:** Messages are applied to the store immediately (version vectors stay current), but the expensive KRT collection rebuild and XDS push are deferred until a quiet period. 10 messages in rapid succession = 10x store updates + 1x KRT Reset + 1x ConfigUpdate.
+**Inbound:** Messages are applied to the store immediately (version vectors stay current), but the expensive KRT collection rebuild and XDS push are deferred until a quiet period. 10 messages in rapid succession = 10x store updates + 1x KRT Reset + 1x ConfigUpdate. Shard expiry checks (`expireStaleShards`) run on every flush, coalescing with message processing.
 
 **Outbound:** Local service change events are deduplicated by hostname (last event wins), batched into a single `SyncMessage` with one version vector increment, and broadcast. At 100 clusters, a 20-service rollout produces 1 message with 20 services instead of 20 individual messages.
 
@@ -298,6 +333,90 @@ This provides **two layers of batching:**
 | `debounceAfter` | 200 ms | Quiet period — slightly longer than Istiod's built-in 100ms |
 | `debounceMax` | 2 s | Maximum wait — bounds worst-case latency during sustained updates |
 | `channel capacity` | 100 | Absorbs bursts without blocking the receive loop |
+
+### Shard Lifecycle: Expiry and Tombstoning
+
+Each remote cluster is tracked as a `clusterShard` in the store:
+
+```go
+type clusterShard struct {
+    ClusterID        cluster.ID
+    Version          uint64
+    Services         map[string]*model.ServiceInfo
+    NetworkGateway   *WireNetworkGateway
+    LastSeen         time.Time              // Updated on every accepted message
+    Tombstoned       bool                   // Dead cluster marker
+    cachedProjection *shardProjection       // Per-shard projection cache
+}
+```
+
+**Expiry flow:**
+1. `shardExpiryLoop` runs every `ShardSweepInterval` (default 1m) on **all replicas**
+2. Signals the debounce loop via a maintenance channel (non-blocking send)
+3. `expireStaleShards` runs during the next flush:
+   - Shards with no messages for `ShardExpiry` (default `max(3×snapshot, 15m)`) are **tombstoned**
+   - Tombstoning clears `.Services`, `.NetworkGateway`, `.cachedProjection` — but **retains `.Version`**
+   - Retaining the version prevents resurrection by stale retained bootstrap messages
+
+**Resurrection:** A tombstoned shard can only be resurrected by a message with a **strictly newer** version. Equal-version re-delivery (common during bootstrap) is rejected for tombstoned shards.
+
+**Grace period:** Shards with zero `LastSeen` (bootstrap-loaded, never received a live message) get one full expiry window before tombstoning.
+
+### Per-Shard Projection Cache
+
+`getFederationState()` aggregates services and workloads across all live shards. To avoid O(shards × services) rebuilds on every flush:
+
+- Each shard maintains a `cachedProjection` containing pre-built `ServiceInfo` and `WorkloadInfo` slices
+- The cache is **invalidated** only when the shard is mutated (new message or tombstoned)
+- On flush, only invalidated shards rebuild their projection; cache hits skip rebuilding
+- Cross-shard gateway deduplication uses UIDs: `NetworkGateway/<network>/<addr>/<port>`
+
+### Panic Recovery
+
+All long-running federation goroutines (debounce loops, snapshot loop, shard expiry, receive loop) are wrapped with `runWithRecovery`:
+
+- Catches panics, logs the stack trace, and increments `pilot_federation_panics_total`
+- Restarts the goroutine after a 1s backoff
+- Ensures a single panic in (e.g.) the inbound debounce loop doesn't silently kill all federation processing
+
+### Health and Readiness
+
+`HealthState` tracks three dimensions for readiness probes:
+
+```go
+type HealthState struct {
+    BootstrapComplete   atomic.Bool   // Set after bootstrap drain completes
+    TransportConnected  atomic.Bool   // Set while transport is receiving
+    LastMessageReceived atomic.Int64  // Unix millis of last processed message
+}
+```
+
+Readiness = `BootstrapComplete && TransportConnected`. The `LastMessageReceived` timestamp enables Kubernetes liveness probes to detect stalled federation (e.g., transport connected but no messages flowing for an extended period).
+
+### Observability: Prometheus Metrics
+
+18 metrics in `metrics.go`:
+
+| Type | Metric | Purpose |
+|---|---|---|
+| Counter | `pilot_federation_messages_received_total` | Messages received from remote clusters |
+| Counter | `pilot_federation_messages_sent_total` | Messages sent to Service Bus |
+| Counter | `pilot_federation_messages_dropped_total` | Messages dropped (stale version, overflow) |
+| Counter | `pilot_federation_shards_expired_total` | Shards tombstoned due to inactivity |
+| Counter | `pilot_federation_shards_resurrected_total` | Tombstoned shards revived by newer version |
+| Counter | `pilot_federation_broadcast_errors_total` | Errors broadcasting to Service Bus |
+| Counter | `pilot_federation_panics_total` | Panics recovered in federation goroutines |
+| Counter | `pilot_federation_projection_cache_hits_total` | Shard projection cache hits |
+| Counter | `pilot_federation_projection_cache_misses_total` | Shard projection cache misses (rebuilds) |
+| Gauge | `pilot_federation_shards_live` | Current live (non-tombstoned) shards |
+| Gauge | `pilot_federation_shards_tombstoned` | Current tombstoned shards |
+| Gauge | `pilot_federation_services` | Current federated service count |
+| Gauge | `pilot_federation_workloads` | Current federated workload count |
+| Gauge | `pilot_federation_is_leader` | 1 if this replica is leader, 0 otherwise |
+| Gauge | `pilot_federation_transport_connected` | 1 if Service Bus transport is connected |
+| Distribution | `pilot_federation_message_size_bytes` | Message size distribution |
+| Distribution | `pilot_federation_bootstrap_duration_seconds` | Bootstrap phase duration |
+| Distribution | `pilot_federation_flush_duration_seconds` | Debounced flush duration |
 
 ### Multi-Replica Support
 
@@ -338,6 +457,34 @@ Federation only replaces the **control plane service discovery transport** (how 
 
 ---
 
+## Synthetic EDS Bridge (Waypoint Proxies)
+
+Istio ambient has two XDS delivery mechanisms:
+1. **Workload XDS** — pushes `workloadapi.Workload`/`Service` protos to ztunnel via `SplitHorizonWorkloads`/`SplitHorizonServices`
+2. **Classic EDS** — Envoy endpoint discovery used by waypoint proxies
+
+Split-horizon workloads (coalesced remote entries routed through gateways) only exist in path #1. The `Synthetic*` pipeline bridges them into path #2:
+
+```
+SplitHorizonWorkloads
+  → filter: remote network, has services, not NetworkGateway/
+  → SyntheticSplitHorizonWorkloads
+  → index by (service, clusterID)
+  → SyntheticSplitHorizonWorkloadServiceShardIndex
+  → transform to IstioEndpoint[] (gate: svc.Service.Waypoint != nil)
+  → SyntheticSplitHorizonServiceShardEndpoints
+  → RegisterBatch → a.XDSUpdater.EDSUpdate()
+  → waypoint proxy receives EDS update
+```
+
+**Gate:** `shouldPublishSyntheticSplitHorizonEDS` = `svc.Service.Waypoint != nil`. Without waypoints, none of the Synthetic code fires — ztunnel handles everything via workload XDS.
+
+**Federation integration:** Federation workloads flow into `SplitHorizonWorkloads` via `splitHorizonComponents`, get filtered into `SyntheticSplitHorizonWorkloads` naturally (they're remote-network, have services, aren't `NetworkGateway/`), and follow the same EDS bridge. No special federation handling needed in the Synthetic chain.
+
+**Fallback address:** EDS requires an endpoint address, but for split-horizon workloads ztunnel routes via the `NetworkGateway` field, not the address. When no real address is available, the sentinel `240.0.0.1` (Class E reserved range 240.0.0.0/4, never routed on the internet) is used.
+
+---
+
 ## SAN Augmentation
 
 **Problem:** When a service exists both locally and via federation, ztunnel receives the local service's empty `SubjectAltNames`. For cross-network traffic, ztunnel builds a double HBONE tunnel (outer to east-west gateway, inner to final destination). The inner tunnel uses `SubjectAltNames` as `final_sans` for TLS verification — empty SANs means unconditional failure.
@@ -350,7 +497,15 @@ Federation only replaces the **control plane service discovery transport** (how 
 > using standard Kubernetes services (which never populate `SubjectAltNames`) would hit the
 > same failure. Consider filing an upstream ztunnel issue.
 
-**Solution:** `augmentServiceWithFederationSANs()` merges federation service SANs into matching local services before they are sent to ztunnel. Verified with 20/20 cross-cluster curl requests succeeding through double HBONE.
+**Solution:** `enrichServiceWithSANs()` (in `federation.go`) merges SPIFFE identities from local workloads into global-scope services before they are published to ztunnel and broadcast to other clusters.
+
+Two entry points:
+- **`AllLocalNetworkGlobalServicesWithSANs()`** — used by the snapshot loop for full-sync publishing. Iterates `localServices` (pre-federation-merge), enriches each global-scope service with local workload SPIFFEs, and returns the enriched set.
+- **`ServiceWithSANs(hostname)`** — used by the incremental outbound path (`processOutgoingDebounced`). Enriches a single service for incremental broadcasting.
+
+Both use `localWorkloadsByServiceKey` (indexed **before** federation merge) to ensure federation workloads are not re-included in SAN computation — preventing double-SAN amplification.
+
+Verified with 20/20 cross-cluster curl requests succeeding through double HBONE.
 
 ---
 
@@ -364,6 +519,8 @@ Federation only replaces the **control plane service discovery transport** (how 
 | `PILOT_SERVICEBUS_TOPIC` | Topic name | `istio-service-sync` |
 | `PILOT_SERVICEBUS_BOOTSTRAP_SUBSCRIPTION` | Shared bootstrap subscription name | `federation-bootstrap` |
 | `PILOT_SERVICEBUS_SNAPSHOT_INTERVAL` | Full-sync publish interval | `5m` |
+| `PILOT_SERVICEBUS_SHARD_EXPIRY` | Tombstone dead shards after this duration | `max(3×snapshot, 15m)` |
+| `PILOT_SERVICEBUS_SHARD_SWEEP_INTERVAL` | Expiry check frequency | `1m` |
 
 **Authentication:** Prefer **Azure Workload Identity** (federated OIDC) over connection strings. Each AKS cluster's Istiod ServiceAccount is federated to an Azure Managed Identity with `Azure Service Bus Data Owner` role on the namespace (covers send, receive, and subscription management). No secrets to rotate.
 
@@ -375,16 +532,19 @@ Federation only replaces the **control plane service discovery transport** (how 
 
 | File | Purpose |
 |---|---|
-| `pilot/pkg/serviceregistry/federation/servicebus.go` | `ServiceBusTransport` — Azure Service Bus pub/sub |
-| `pilot/pkg/serviceregistry/federation/sync.go` | `SyncProtocol` — federation orchestrator |
-| `pilot/pkg/serviceregistry/federation/store.go` | `federationStore` — remote service data store |
-| `pilot/pkg/serviceregistry/federation/types.go` | `SyncMessage`, wire types |
-| `pilot/pkg/serviceregistry/federation/version.go` | Version vector tracking |
+| `pilot/pkg/serviceregistry/federation/servicebus.go` | `ServiceBusTransport` — Azure Service Bus pub/sub + `bootstrapMerger` |
+| `pilot/pkg/serviceregistry/federation/sync.go` | `SyncProtocol` — orchestrator, debounce loops, snapshot loop, `HealthState` |
+| `pilot/pkg/serviceregistry/federation/store.go` | `federationStore` — state store, shard expiry/tombstoning, projection cache |
+| `pilot/pkg/serviceregistry/federation/types.go` | `SyncMessage`, `WireServiceInfo`, `clusterShard`, wire types |
+| `pilot/pkg/serviceregistry/federation/version.go` | Version vector (time-seeded for cross-leader monotonicity) |
+| `pilot/pkg/serviceregistry/federation/metrics.go` | 18 Prometheus metrics (counters, gauges, distributions) |
+| `pilot/pkg/serviceregistry/federation/store_test.go` | 51 tests: store, expiry, tombstone, cache, bootstrap, convergence |
+| `pilot/pkg/serviceregistry/federation/types_test.go` | Wire type serialization tests |
 | `pilot/pkg/features/ambient.go` | Feature flags |
 | `pilot/pkg/bootstrap/federation.go` | `initFederationSync` bootstrap wiring |
-| `pilot/pkg/serviceregistry/kube/controller/ambient/federation.go` | Ambient index federation methods + SAN augmentation |
+| `pilot/pkg/serviceregistry/kube/controller/ambient/federation.go` | `enrichServiceWithSANs`, outbound SAN augmentation, service handler |
 | `pilot/pkg/serviceregistry/kube/controller/ambient/federation_source.go` | `FederationSource` — krt StaticCollection bridge |
-| `pilot/pkg/serviceregistry/kube/controller/ambient/multicluster.go` | `buildGlobalCollections` — merges federation into ambient |
+| `pilot/pkg/serviceregistry/kube/controller/ambient/multicluster.go` | `buildGlobalCollections` — merges federation into ambient + Synthetic EDS |
 | `pilot/pkg/model/service.go` | `FederationAmbientIndex` interface |
 
 ### Status
@@ -395,9 +555,32 @@ Federation only replaces the **control plane service discovery transport** (how 
 | 3-cluster kind test (c1/c2/c3, shared CA, MetalLB E/W gateways) | Done |
 | Cross-cluster data path (double HBONE + SAN augmentation) | Done |
 | Delete/redeploy cycle verification | Done |
+| Shard liveness, expiry, and tombstoning | Done |
+| Prometheus metrics (18 metrics: counters, gauges, distributions) | Done |
+| Panic recovery with backoff for all federation goroutines | Done |
+| Gateway dedupe key fix (cluster-scoped UIDs) | Done |
+| Incremental flush (per-shard projection cache) | Done |
+| Health/readiness integration (`HealthState`) | Done |
+| Clean up ambient dual-path injection (single merge point) | Done |
+| Streaming bootstrap merge (`bootstrapMerger`) | Done |
+| Comprehensive test suite (51 tests covering store, protocol, convergence) | Done |
 | Infrastructure automation (Bicep, Workload Identity) | Planned |
 | AKS scale testing (10-cluster, 100-cluster simulation) | Planned |
 | Failure scenario testing (Service Bus outage, split-brain) | Planned |
+
+### Test Coverage
+
+51 tests in `store_test.go` covering:
+
+- **Version vector**: Stale rejection, equal-version semantics, out-of-order delivery, multi-cluster independence
+- **Full sync**: Replaces entire shard, empty full sync clears shard
+- **Incremental**: Add, delete, combined add+delete in same message, nonexistent hostname delete
+- **Expiry/tombstone**: Dead cluster removal, live cluster preservation, bootstrap grace period, mixed states, resurrection by newer version, tombstone blocks retained bootstrap
+- **Projection cache**: Hit on unchanged shard, invalidated on new message, invalidated on expiry, selective multi-shard invalidation
+- **Health state**: Initial state, readiness requires both flags, last message tracking, disconnect/reconnect
+- **Bootstrap merger**: Empty input, single/superseded full syncs, incrementals ordering, stale discard, multi-cluster, incrementals-only
+- **Convergence**: Bootstrap → incrementals, full sync heals stale state, tombstone blocks retained bootstrap
+- **Edge cases**: Self-message ignored, nil message, channel overflow drops
 
 ---
 
