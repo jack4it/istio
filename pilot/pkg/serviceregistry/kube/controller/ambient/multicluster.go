@@ -1061,6 +1061,8 @@ func syntheticSplitHorizonEndpointAddress(wl model.WorkloadInfo, svc model.Servi
 			}
 		}
 	}
+	// Class E reserved range (240.0.0.0/4) — never routed on the internet.
+	// EDS requires an address, but ztunnel routes via NetworkGateway, so this is never connected to.
 	return "240.0.0.1"
 }
 
