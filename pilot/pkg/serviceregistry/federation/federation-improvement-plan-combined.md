@@ -134,6 +134,57 @@ GPT-5.4 says SAN augmentation compensates for the wrong boundary. Architecturall
 | 16 | Revisit federation as native ambient model vs synthetic workloads | Design | GPT-5.4 |
 | 17 | Rename `versionVector` to `sequenceCounter` | 30 min | Both |
 
+### #16 Deep Dive: Native Ambient Model vs Synthetic Workloads
+
+**Status: Investigated. Recommendation: keep synthetic model with incremental improvements.**
+
+#### Why "Synthetic" exists in multicluster.go
+
+Istio ambient has two XDS delivery mechanisms that must stay in sync:
+
+1. **Workload XDS (ztunnel)** — pushes `workloadapi.Workload`/`Service` protos directly via `SplitHorizonWorkloads`/`SplitHorizonServices`.
+2. **EDS (waypoint proxies)** — classic Envoy endpoint discovery via `EDSUpdate()`.
+
+Split-horizon workloads (coalesced remote-network entries routed through gateways) only exist in path #1. The `Synthetic*` chain bridges them into path #2:
+
+```
+SplitHorizonWorkloads
+  → filter: remote network, has services, not NetworkGateway/ → SyntheticSplitHorizonWorkloads
+  → index by (service, clusterID) → SyntheticSplitHorizonWorkloadServiceShardIndex
+  → transform to IstioEndpoint[] (gated on svc.Waypoint != nil) → SyntheticSplitHorizonServiceShardEndpoints
+  → RegisterBatch → a.XDSUpdater.EDSUpdate()
+```
+
+Without waypoints, none of the Synthetic code fires. Federation workloads enter `SplitHorizonWorkloads` via `splitHorizonComponents`, get filtered into `SyntheticSplitHorizonWorkloads` naturally, and follow the same EDS bridge as native coalesced workloads — no special federation handling needed.
+
+#### Native vs Federation Split-Horizon Comparison
+
+| Dimension | Native (upstream) | Federation (current) |
+|---|---|---|
+| Workload granularity | One per Pod/WLE | One per (service, gateway) |
+| Capacity | Sum of all remote workload weights | Hardcoded 1 |
+| Service account | Per-workload SA from k8s metadata | Parsed from first SAN only |
+| Multi-SA services | All remote SAs collected | Only first SA (P2 #12) |
+| AuthZ policies | Policy selectors match real pod labels | No labels → no policy matching |
+| Data freshness | Direct k8s watch, sub-second | Service Bus pub/sub, debounced |
+| SAN flow | Workloads drive SANs (pull-based) | Services drive SANs (push-based) |
+
+#### Three Options Considered
+
+**Option A — Keep synthetic as-is with incremental fixes**: Wire format stays compact. Store logic is self-contained. Multi-SA gap (P2 #12) fixable by sending all SANs. Capacity=1 fixable by adding workload count field.
+
+**Option B — Native workload-level federation**: Full fidelity (real SAs, labels, capacity, AuthZ). Eliminates SAN augmentation duplication. But: wire format explosion (N workloads × M services per cluster), higher Service Bus bandwidth, tight coupling to ambient KRT internals that break on any graph refactoring.
+
+**Option C — Hybrid (recommended)**: Keep compact service-level wire format. Extend `SyncMessage` with: all SANs per service (not just first), workload count for accurate capacity, optional labels if cross-cluster AuthZ needed. Federation store remains "producer-side coalescence" — the same grouping the native `coalescedWorkloads` pipeline does, just at the sender.
+
+#### Key Insight
+
+The fundamental constraint: federation receives *service-level* data, not *workload-level* data. The `SyncMessage` wire format carries services + one `NetworkGateway` per shard. Sending per-workload data over Service Bus is prohibitive at scale. The federation store synthesizes what the coalescence pipeline would produce — this is intentionally lossy but correct for the data available.
+
+#### Index Ordering Constraint
+
+`localWorkloadsByServiceKey` is created BEFORE federation merge (~line 327 vs ~345) because outbound `ServiceWithSANs` must index only native workloads. If created after merge, federation workloads would be indexed too, causing duplicate SAN augmentation (federation workloads already carry correct SANs from `store.go`).
+
 ---
 
 ## What's Done Well (Preserve During Improvement)
