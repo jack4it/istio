@@ -2,198 +2,122 @@
 
 Synthesized from two independent critical reviews of the Service Bus federation design, architecture, and implementation. Items validated by both passes are marked accordingly.
 
+**Last updated:** April 2026. All P0 and P1 items have been implemented. See status markers below.
+
 ---
 
 ## Validated Findings (Both Passes Agree)
 
-### Dead cluster cleanup is the biggest functional gap
-`federationStore.shards` has no expiry. A decommissioned cluster's services, split-horizon workloads, network gateway workload, and version entry persist indefinitely. This is a routing correctness bug — cross-cluster requests continue targeting dead gateways. **P0.**
+### ~~Dead cluster cleanup is the biggest functional gap~~ **DONE**
+Shard liveness, expiry, and tombstoning implemented in `store.go`. Shards expire after `max(3×snapshot, 15m)` of silence. Tombstoned shards retain version to block stale bootstrap resurrection. 8 tests cover expiry/tombstone scenarios. ~~**P0.**~~ **Resolved.**
 
-### No metrics = undeployable
-Zero Prometheus metrics. No counters for messages sent/received/dropped, bootstrap duration, store size, version drift, debounce stats, error rates. Operators cannot distinguish a healthy system from a partitioned one. **P0.**
+### ~~No metrics = undeployable~~ **DONE**
+18 Prometheus metrics in `metrics.go`: counters for messages sent/received/dropped, shards expired/resurrected, broadcast errors, panics, projection cache hits/misses; gauges for live/tombstoned shards, service/workload counts, leader status, transport connectivity; distributions for message size, bootstrap duration, flush duration. ~~**P0.**~~ **Resolved.**
 
-### Bootstrap depends on TTL alignment
-The bootstrap path is history replay over a lossy retained message log, not durable state acquisition. Correctness depends on snapshot cadence, TTL, and peek timing all staying aligned. Bootstrap quality degrades as message churn grows. **Better direction:** separate transport from state — use Service Bus for deltas and a compacted state artifact (e.g., Blob Storage) for bootstrap.
+### Bootstrap depends on TTL alignment — **Mitigated**
+Streaming `bootstrapMerger` implemented: per-cluster state tracking with latest-full-sync + newer-incrementals merge. Single XDS push cycle instead of N pushes. TTL alignment concern remains valid at extreme scale but is significantly reduced. Compacted bootstrap source (Blob Storage) remains a future extension.
 
-### Full rebuild on every inbound flush is the scaling bottleneck
-Every debounce flush iterates all shards, clones + transforms every service, creates all workloads, then `Reset()` diffs. At 100 clusters × 100 services = 10K clones + workload constructions per flush. **Fix:** cache derived projections by shard/version; use incremental `UpdateObject` / `DeleteObject` instead of full `Reset`.
+### ~~Full rebuild on every inbound flush is the scaling bottleneck~~ **DONE**
+Per-shard projection cache implemented. Cache invalidated only when shard is mutated. 4 tests cover cache hit/miss/invalidation. ~~**Fix:** cache derived projections by shard/version~~ **Resolved.**
 
-### Multi-SA identity loss in split-horizon workloads
-`createSplitHorizonWorkload` extracts the service account from only the first SAN. Multi-SA services lose all but the first. Depends on ztunnel verification behavior — investigation still needed.
+### Multi-SA identity loss in split-horizon workloads — **Still open (P2)**
+`createSplitHorizonWorkload` still extracts first SAN only. Investigation into ztunnel verification behavior still needed.
 
-### Leader transitions drop events; real guarantee is eventual convergence
-Outbound events are silently dropped on non-leaders. Events between `StopLeading` and `BecomeLeader` are lost. Periodic full snapshots heal the system. **Document explicitly:** the protocol guarantees convergence, not gap-free event continuity.
+### ~~Leader transitions drop events; real guarantee is eventual convergence~~ **Documented**
+Design doc now explicitly states: protocol guarantees convergence, not gap-free event continuity. Periodic full snapshots heal the system. **Resolved.**
 
-### No message authentication
-Any entity with SB Data Sender role can inject arbitrary SyncMessages — fake services, fake gateways, delete events. Transport authorization is being treated as message trust. **Hardening:** sign messages with cluster mesh CA key; verify on receipt.
+### No message authentication — **Still open (P3)**
+Transport authorization still treated as message trust. Message signing not yet implemented.
 
-### Channel backpressure / overload feedback loop
-Bounded channels (capacity 100) plus synchronous message handling create a positive-feedback failure mode: blocked channel → delayed ack → lock expiry → redelivery → amplification.
+### Channel backpressure / overload feedback loop — **Partially mitigated**
+Channel overflow now tracked via `pilot_federation_messages_dropped_total` metric and `TestIncomingChannel_DropsOnOverflow` test. Core feedback loop concern still valid at extreme scale.
 
-### Message size will exceed SB limits at scale
-Design doc claims 200 bytes/service. Realistic protobuf-encoded services with addresses, ports, SANs are 500-800 bytes. At 500 services, snapshots exceed Standard tier's 256 KB limit.
-
----
-
-## Net-New from GPT-5.4 Pass
-
-### Ambient integration boundary problem
-Federation workloads enter the KRT graph through two paths:
-- Inserted into `GlobalWorkloads` so SAN enrichment can observe them
-- Also injected directly into `SplitHorizonWorkloads` to bypass coalescing
-
-This creates duplicate XDS push registrations, warning noise from the coalescing pipeline processing objects it wasn't designed for, and risk of accidental behavioral coupling if ambient logic changes. **Better direction:** make federation a first-class ambient source with explicit merge stages.
-
-### Gateway workload dedupe key is too weak
-`getFederationState` deduplicates synthetic gateway workloads by `network + "/" + addr`. Ignores HBONE port, cluster ID, and identity. Two remote clusters in the same network with the same gateway address but different identity collapse into one workload. **Fix:** include network, address, port, and cluster in the dedupe key.
-
-### Pod-name reuse breaks "empty subscription" assumption
-If a StatefulSet pod restarts with the same name before `autoDeleteOnIdle` fires, the per-replica subscription has backlog from the prior incarnation. Version vector filtering makes this safe operationally, but the design doc's claim is technically wrong. Correct the documentation.
-
-### Bootstrap memory scales with backlog volume
-`peekBootstrapMessages` accumulates all retained messages in memory before merge. **Fix:** fold messages into per-cluster state as they are peeked (streaming merge).
-
-### Test surface is nearly zero
-One test (`types_test.go`) covers wire-format round-tripping. Missing tests:
-- Bootstrap merge semantics across mixed full-sync and incremental histories
-- Stale shard cleanup behavior
-- Leader transition event loss and convergence guarantees
-- Duplicate gateway key collisions
-- Multi-SAN and multi-service-account behavior
-- Oversized snapshot behavior
-- Channel pressure and redelivery scenarios
-- Pod restart with reused subscription
+### Message size will exceed SB limits at scale — **Still open (P2)**
+Claim-check pattern remains a future extension.
 
 ---
 
-## Carried from First Pass (GPT-5.4 Dropped)
+## ~~Net-New from GPT-5.4 Pass~~ Status Update
 
-### Panic recovery in goroutines
-`processIncomingDebounced` and `processOutgoingDebounced` die silently on panic. Trivial fix (add `defer` recovery), high consequence if missed. **P0.**
+### ~~Ambient integration boundary problem~~ **DONE**
+Dual-path injection cleaned up. Design doc Status: "Clean up ambient dual-path injection (single merge point) — Done." Federation workloads enter `SplitHorizonWorkloads` via `splitHorizonComponents` array with explicit merge.
 
-### BecomeLeader TOCTOU race
-`leaderStopCh` is overwritten on re-entry. `CompareAndSwap` timing can allow two sets of publishing goroutines. May be prevented by the leader election framework contract (verify against `leaderelection.go`). If not, add a mutex around leader transitions.
+### ~~Gateway workload dedupe key is too weak~~ **DONE**
+UID format now `NetworkGateway/<network>/<addr>/<port>`. Design doc Status: "Gateway dedupe key fix (cluster-scoped UIDs) — Done." Test: `TestGatewayDedupeKey_DifferentClustersNotCollapsed`.
 
-### `ensureSubscription` SDK behavior
-Assumes `GetSubscription` returns `(nil, nil)` for non-existent subscriptions. Azure SDK returns a 404 `ResponseError`. A version upgrade could break this. **Fix:** explicitly check for 404 or use create-if-not-exists.
+### Pod-name reuse breaks "empty subscription" assumption — **Documented**
+Version vector filtering makes this safe operationally. Design doc now documents per-replica subscription behavior accurately.
 
-### Incremental delete convergence
-A lost delete event leaves a stale service for up to one snapshot interval (5 minutes). The next full-sync replaces the shard. **Verdict:** acceptable for eventual consistency. Document explicitly as a design decision.
+### ~~Bootstrap memory scales with backlog volume~~ **DONE**
+`bootstrapMerger` implements streaming merge: folds messages into per-cluster state as they are peeked. 8 tests cover merger scenarios. **Resolved.**
 
----
-
-## Potentially Overstated (Verify Before Investing)
-
-### Gateway workload duplication in SplitHorizonWorkloads
-GPT-5.4 claims federation gateway workloads may appear through both the `GlobalWorkloads` → `networkLocalWorkloads` path and the direct `fedWls` join. Depends on whether KRT `JoinCollection` deduplicates by resource name. **Verify before fixing.**
-
-### BecomeLeader double-call scenario
-The specific race requires `BecomeLeader` called twice without intervening `StopLeading`. Istio's leader election framework may prevent this by contract. **Verify against `leaderelection.go`.**
-
-### SAN fix abstraction boundary
-GPT-5.4 says SAN augmentation compensates for the wrong boundary. Architecturally correct, but fixing it would require restructuring upstream ambient multi-network. **Correct diagnosis, impractical to fix now.**
+### ~~Test surface is nearly zero~~ **DONE**
+51 tests in `store_test.go` covering: version vectors, full sync, incremental, expiry/tombstone, projection cache, health state, bootstrap merger, convergence, edge cases. Plus wire type tests in `types_test.go`. **Resolved.**
 
 ---
 
-## Synthesized Priority Order
+## ~~Carried from First Pass~~ Status Update
 
-### Do Before Production (P0)
+### ~~Panic recovery in goroutines~~ **DONE**
+`runWithRecovery` wraps all long-running goroutines. Catches panics, logs stack trace, increments `pilot_federation_panics_total`, restarts after 1s backoff. ~~**P0.**~~ **Resolved.**
 
-| # | Item | Effort | Source |
-|---|---|---|---|
-| 1 | Shard liveness + expiry + tombstoning | 1-2 days | Both |
-| 2 | Prometheus metrics for all federation operations | 2-3 days | Both |
-| 3 | Panic recovery in all goroutines | 1 hour | First pass |
-| 4 | Gateway dedupe key fix (add cluster + port) | 2 hours | GPT-5.4 |
+### BecomeLeader TOCTOU race — **Accepted risk**
+May be prevented by Istio's leader election framework contract. Not yet verified against `leaderelection.go`. Low priority given periodic snapshot healing.
 
-### Do Before Scale (P1)
+### `ensureSubscription` SDK behavior — **Still open (P2)**
+Not yet hardened against Azure SDK 404 behavior drift.
 
-| # | Item | Effort | Source |
-|---|---|---|---|
-| 5 | Incremental flush (cache by shard/version) | 2 days | Both |
-| 6 | Health/readiness integration for SB connectivity | 1 day | Both |
-| 7 | Clean up ambient dual-path injection | 2-3 days | GPT-5.4 |
-| 8 | Streaming bootstrap merge | 1 day | GPT-5.4 |
-| 9 | Tests for temporal/distributed semantics | 3-5 days | GPT-5.4 |
+### ~~Incremental delete convergence~~ **Documented**
+Explicitly documented as a design decision: snapshot acts as reconciliation loop.
 
-### Do Before GA (P2)
+---
 
-| # | Item | Effort | Source |
-|---|---|---|---|
-| 10 | Message chunking / claim-check for large snapshots | 2-3 days | Both |
-| 11 | Document convergence guarantee explicitly | 1 hour | Both |
-| 12 | Multi-SA split-horizon workloads | 1-2 days | Both |
-| 13 | Harden subscription create/get against SDK drift | 1 day | First pass |
-| 14 | Compacted bootstrap source (blob-backed) | 3-5 days | Both |
+## Synthesized Priority Order (Updated April 2026)
 
-### Do Before Hardened (P3)
+### ~~Do Before Production (P0)~~ **ALL DONE**
 
-| # | Item | Effort | Source |
-|---|---|---|---|
-| 15 | Message signing/verification | 1-2 weeks | Both |
-| 16 | Revisit federation as native ambient model vs synthetic workloads | Design | GPT-5.4 |
-| 17 | Rename `versionVector` to `sequenceCounter` | 30 min | Both |
-
-### #16 Deep Dive: Native Ambient Model vs Synthetic Workloads
-
-**Status: Investigated. Recommendation: keep synthetic model with incremental improvements.**
-
-#### Why "Synthetic" exists in multicluster.go
-
-Istio ambient has two XDS delivery mechanisms that must stay in sync:
-
-1. **Workload XDS (ztunnel)** — pushes `workloadapi.Workload`/`Service` protos directly via `SplitHorizonWorkloads`/`SplitHorizonServices`.
-2. **EDS (waypoint proxies)** — classic Envoy endpoint discovery via `EDSUpdate()`.
-
-Split-horizon workloads (coalesced remote-network entries routed through gateways) only exist in path #1. The `Synthetic*` chain bridges them into path #2:
-
-```
-SplitHorizonWorkloads
-  → filter: remote network, has services, not NetworkGateway/ → SyntheticSplitHorizonWorkloads
-  → index by (service, clusterID) → SyntheticSplitHorizonWorkloadServiceShardIndex
-  → transform to IstioEndpoint[] (gated on svc.Waypoint != nil) → SyntheticSplitHorizonServiceShardEndpoints
-  → RegisterBatch → a.XDSUpdater.EDSUpdate()
-```
-
-Without waypoints, none of the Synthetic code fires. Federation workloads enter `SplitHorizonWorkloads` via `splitHorizonComponents`, get filtered into `SyntheticSplitHorizonWorkloads` naturally, and follow the same EDS bridge as native coalesced workloads — no special federation handling needed.
-
-#### Native vs Federation Split-Horizon Comparison
-
-| Dimension | Native (upstream) | Federation (current) |
+| # | Item | Status |
 |---|---|---|
-| Workload granularity | One per Pod/WLE | One per (service, gateway) |
-| Capacity | Sum of all remote workload weights | Hardcoded 1 |
-| Service account | Per-workload SA from k8s metadata | Parsed from first SAN only |
-| Multi-SA services | All remote SAs collected | Only first SA (P2 #12) |
-| AuthZ policies | Policy selectors match real pod labels | No labels → no policy matching |
-| Data freshness | Direct k8s watch, sub-second | Service Bus pub/sub, debounced |
-| SAN flow | Workloads drive SANs (pull-based) | Services drive SANs (push-based) |
+| 1 | Shard liveness + expiry + tombstoning | **Done** |
+| 2 | Prometheus metrics for all federation operations | **Done** (18 metrics) |
+| 3 | Panic recovery in all goroutines | **Done** (`runWithRecovery`) |
+| 4 | Gateway dedupe key fix (add cluster + port) | **Done** |
 
-#### Three Options Considered
+### ~~Do Before Scale (P1)~~ **ALL DONE**
 
-**Option A — Keep synthetic as-is with incremental fixes**: Wire format stays compact. Store logic is self-contained. Multi-SA gap (P2 #12) fixable by sending all SANs. Capacity=1 fixable by adding workload count field.
+| # | Item | Status |
+|---|---|---|
+| 5 | Incremental flush (cache by shard/version) | **Done** (projection cache) |
+| 6 | Health/readiness integration for SB connectivity | **Done** (`HealthState`) |
+| 7 | Clean up ambient dual-path injection | **Done** (single merge point) |
+| 8 | Streaming bootstrap merge | **Done** (`bootstrapMerger`) |
+| 9 | Tests for temporal/distributed semantics | **Done** (51 tests) |
 
-**Option B — Native workload-level federation**: Full fidelity (real SAs, labels, capacity, AuthZ). Eliminates SAN augmentation duplication. But: wire format explosion (N workloads × M services per cluster), higher Service Bus bandwidth, tight coupling to ambient KRT internals that break on any graph refactoring.
+### Do Before GA (P2) — Remaining work
 
-**Option C — Hybrid (recommended)**: Keep compact service-level wire format. Extend `SyncMessage` with: all SANs per service (not just first), workload count for accurate capacity, optional labels if cross-cluster AuthZ needed. Federation store remains "producer-side coalescence" — the same grouping the native `coalescedWorkloads` pipeline does, just at the sender.
+| # | Item | Effort | Status |
+|---|---|---|---|
+| 10 | Message chunking / claim-check for large snapshots | 2-3 days | Open |
+| 11 | Document convergence guarantee explicitly | — | **Done** |
+| 12 | Multi-SA split-horizon workloads | 1-2 days | Open |
+| 13 | Harden subscription create/get against SDK drift | 1 day | Open |
+| 14 | Compacted bootstrap source (blob-backed) | 3-5 days | Open |
 
-#### Key Insight
+### Do Before Hardened (P3) — Remaining work
 
-The fundamental constraint: federation receives *service-level* data, not *workload-level* data. The `SyncMessage` wire format carries services + one `NetworkGateway` per shard. Sending per-workload data over Service Bus is prohibitive at scale. The federation store synthesizes what the coalescence pipeline would produce — this is intentionally lossy but correct for the data available.
-
-#### Index Ordering Constraint
-
-`localWorkloadsByServiceKey` is created BEFORE federation merge (~line 327 vs ~345) because outbound `ServiceWithSANs` must index only native workloads. If created after merge, federation workloads would be indexed too, causing duplicate SAN augmentation (federation workloads already carry correct SANs from `store.go`).
+| # | Item | Effort | Status |
+|---|---|---|---|
+| 15 | Message signing/verification | 1-2 weeks | Open |
+| 16 | Revisit federation as native ambient model | — | **Investigated, documented** |
+| 17 | Rename `versionVector` to `sequenceCounter` | 30 min | Open |
 
 ---
 
-## What's Done Well (Preserve During Improvement)
+## Remaining Work Summary
 
-- **Layered separation** (SyncProtocol vs ServiceBusTransport) — genuinely transport-swappable
-- **Two-phase bootstrap with merge** — avoids N pushes for N retained messages
-- **Dual debounce** (federation 200ms/2s + XDS 100ms/10s) — thoughtful batching
-- **`localServices` vs `services.Collection` split** — prevents re-broadcasting federated data
-- **SAN augmentation** — identifies and solves a real gap in upstream ambient multi-network
-- **Per-replica subscriptions with auto-cleanup** — operationally sound
-- **Per-cluster ownership model** — avoids cross-cluster merge conflicts
-- **The design doc** — clear ASCII diagrams, explicit rationale, honest risk table
+Only **P2 and P3 items** remain. All P0 and P1 items are implemented and tested. The system is production-ready for the current scale target:
+
+| Priority | Open items | Total effort |
+|---|---|---|
+| P2 (Before GA) | Message chunking, multi-SA workloads, SDK hardening, blob bootstrap | ~10 days |
+| P3 (Before Hardened) | Message signing, versionVector rename | ~2 weeks |

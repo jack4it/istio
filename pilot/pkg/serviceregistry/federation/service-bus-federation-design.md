@@ -6,10 +6,13 @@ Multi-cluster Istio ambient mode requires each cluster's Istiod to know about se
 every other cluster. At scale (100+ AKS clusters), direct peer-to-peer service discovery
 becomes impractical:
 
-- **O(n²) connections** — every Istiod must reach every other Istiod over a direct network
-  path. At 100 clusters, that's 4,950 bidirectional connections requiring an overlay network.
-- **No persistence** — if a new cluster joins, it must query all peers to build initial
-  state, which is slow and unreliable with intermittent connectivity.
+- **O(n²) watch/connection growth** — each cluster adds more peer API servers and watch
+  streams to maintain. As cluster count grows, network reachability and watch fan-out become
+  the dominant scaling bottleneck.
+
+- **High management-plane reconciliation cost** — AppLink membership (ambient + multi-cluster)
+  requires continuously reconciling who belongs to the mesh and where updates should flow.
+  With peer-to-peer discovery, this coordination complexity grows quickly and is operationally brittle.
 
 Azure Service Bus replaces direct peer-to-peer discovery with a managed pub/sub broker:
 
@@ -38,8 +41,8 @@ Azure Service Bus replaces direct peer-to-peer discovery with a managed pub/sub 
 
 Each Istiod:
 - **Publishes** service snapshots and incremental updates to the topic
-- **Receives** updates from all other clusters via its own exclusive subscription
-- Uses a **per-cluster subscription** with a SQL filter (`ClusterID <> 'self'`) so it doesn't receive its own messages
+- **Receives** updates from all other clusters via per-replica subscriptions
+- Uses a **per-replica subscription** with a SQL filter (`ClusterID <> 'self'`) so it doesn't receive its own messages
 - No direct network path between any two Istiods is required
 
 ---
