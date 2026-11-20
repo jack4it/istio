@@ -625,6 +625,7 @@ The following environment variables can be used to configure the KinD cluster se
 |---|---|
 | `SKIP_SETUP` | Skip KinD cluster setup entirely if set. Useful when reusing an existing cluster. |
 | `NOMETALBINSTALL` | Skip MetalLB installation if set. Useful when using [cloud-provider-kind](https://github.com/kubernetes-sigs/cloud-provider-kind). |
+| `KUBERNETES_CNI` | Use `calico` or `cilium` instead of the default KinD CNI. Cilium currently supports IPv4 only. |
 | `ISTIO_BASE_REGISTRY` | Registry containing the base images used by `dockerx.pushx`. Defaults to `docker.io/istio`. |
 | `ISTIO_BUILDKIT_IMAGE` | BuildKit image used by the Docker builder. Defaults to `registry.istio.io/testing/buildkit:v0.11.0`. |
 | `WASM_REGISTRY` | Registry containing the Wasm test artifacts copied to the KinD registry. Defaults to `registry.istio.io/testing`. |
@@ -634,6 +635,25 @@ The following environment variables can be used to configure the KinD cluster se
 | `PROMETHEUS_CONFIG_RELOADER_REGISTRY` | Repository prefix for the Prometheus config-reloader image. Defaults to `ghcr.io/prometheus-operator`; may include a pull-through cache path. |
 | `ZIPKIN_REGISTRY` | Repository prefix for the Zipkin image. Defaults to `ghcr.io/openzipkin`; may include a pull-through cache path. |
 | `OTEL_REGISTRY` | Repository prefix for the OpenTelemetry Collector image. Defaults to `docker.io/otel`; may include a pull-through cache path. |
+
+### Cilium Host-Probe Regression
+
+The Cilium host-probe test uses a dedicated two-node cluster with BPF host routing,
+BPF masquerading, and kube-proxy replacement. It checks healthy and failing
+kubelet probes under strict mTLS, verifies that unauthenticated traffic is denied,
+and checks local route cleanup and recreation when the CNI option changes.
+Run it on a disposable Docker host:
+
+```bash
+KUBERNETES_CNI=cilium \
+  T='-v -count=1 -run=^TestCiliumHostProbes$' \
+  INTEGRATION_TEST_FLAGS='--istio.test.ambient --istio.test.kube.helm.values=cni.env.AMBIENT_ENABLE_HOST_PROBE_LOCAL_ROUTE=true' \
+  prow/integ-suite-kind.sh --node-image kindest/node:v1.35.8 \
+    --kind-config prow/config/ambient-cilium.yaml test.integration.ambient.kube.environment
+```
+
+This test changes and restores the Istio CNI DaemonSet. It covers the pinned
+Cilium 1.18.14 configuration, not all Cilium routing modes or IP families.
 
 ## Diagnosing Failures
 
